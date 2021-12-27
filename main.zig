@@ -6,26 +6,43 @@ const wayland = @import("wayland");
 const wl = wayland.client.wl;
 const xdg = wayland.client.xdg;
 
-const Context = struct {
+const WlGlobals = struct {
   compositor: ?*wl.Compositor,
   shm: ?*wl.Shm,
   xdg: ?*xdg.WmBase,
 };
 
-const GridSurface = struct {
+const Context = struct {
   width: usize,
   height: usize,
-  data: []u8,
+  shm_fd: i32,
+  shm_pool: *wl.ShmPool,
+  // TODO: does this need to be nulllable?
+  displayBuffer: DisplayBuffer,
+  running: bool,
+  configured: bool,
+  surface: *wl.Surface,
+  toplevel: *const xdg.Toplevel,
 };
 
+const DisplayBuffer = struct {
+  width: usize,
+  height: usize,
+  stride: usize,
+  data: []align(4096) u8,
+  buffer: *wl.Buffer,
+};
+
+// Used to get wayland globals
 fn registryListner(registry: *wl.Registry,
                    event: wl.Registry.Event,
-                   ctx: *Context) void {
+                   ctx: *WlGlobals) void {
  switch (event) {
     .global => |g| {
       // print("interface: {s},\tversion: {},\tname: {}\n", .{g.interface, g.version, g.name});
+      // TODO: use a lookup table for this
       if (std.cstr.cmp(g.interface, wl.Compositor.getInterface().name) == 0) {
-        print("Got Compositor\n", .{});
+        print("Got {s}\n", .{wl.Compositor.getInterface().name});
         ctx.compositor = registry.bind(g.name, wl.Compositor, 4) catch return;
       } else if (std.cstr.cmp(g.interface, wl.Shm.getInterface().name) == 0) {
         print("Got Shm\n", .{});
@@ -39,53 +56,123 @@ fn registryListner(registry: *wl.Registry,
   }
 }
 
+// Ack the configure event
 fn surfaceListener(xdg_surface: *xdg.Surface,
                    event: xdg.Surface.Event,
-                   surface: *wl.Surface) void {
+                   ctx: *Context) void {
   print("surfaceListener: {}\n", .{event});
   switch (event) {
     .configure => |configure| {
+      print("Ack configure\n", .{});
+      ctx.configured = true;
       xdg_surface.ackConfigure(configure.serial);
-      surface.commit();
+      render(ctx);
     }
   }
 }
 
-fn topLevelListener(_: *xdg.Toplevel, event: xdg.Toplevel.Event, running: *bool) void {
-  print("top level event: {}\n", .{event});
+// Resize, and Close events
+fn topLevelListener(_: *xdg.Toplevel,
+                    event: xdg.Toplevel.Event,
+                    ctx: *Context) void {
+  // print("top level event: {}\n", .{event});
   switch (event) {
-    .close => running.* = false,
-    .configure => {} // TODO
+    .close => ctx.running = false,
+    .configure => |config| { // resize event
+      print("resize from {}\n", .{ctx.height});
+      // replace zero size with defaults
+      if (config.height > 0) ctx.height = @intCast(usize, config.height);
+      if (config.height > 0) ctx.width = @intCast(usize, config.width);
+      render(ctx);
+    }
   }
 }
 
-fn baseListener(base: *xdg.WmBase, event: xdg.WmBase.Event, running: *bool) void {
+// Let the compositor know we're not deadlocked
+fn baseListener(wm: *xdg.WmBase, event: xdg.WmBase.Event, _: *Context) void {
   print("base event: {}\n", .{event});
-  _ = running;
-  _ = base;
   switch (event) {
     .ping => |ping| {
-      base.pong(ping.serial);
+      wm.pong(ping.serial);
     }
   }
 }
 
-fn drawGrid(ctx: GridSurface) void {
-  const size = @maximum(ctx.width, ctx.height) / 5;
-  // TODO: assert data.length = size
-  print("size: {}, length: {}\n", .{size, size});
+// Buffer release
+fn bufListener(buf: *wl.Buffer, event: wl.Buffer.Event, _: *DisplayBuffer) void {
+  _ = buf;
+  switch (event) {
+    .release => |_| {
+      print("Buffer released\n", .{});
+      // buf.destroy();
+    }
+  }
+}
+
+// Draw a test grid to the provided buffer
+fn drawGrid(buf: *DisplayBuffer) void {
+  const size = @minimum(buf.width, buf.height) / 10;
+
   var y: usize = 0;
-  while (y < ctx.height) {
+  while (y < buf.height) {
     var x: usize = 0;
-    while (x < ctx.height) {
-      ctx.data[(y * ctx.width + x) * 4] = if (y % (2*size) > size) 0xFF else 0x00; // blue
-      ctx.data[(y * ctx.width + x) * 4 + 1] = if (x % (2*size) > size) 0xFF else 0x00; // green
-      ctx.data[(y * ctx.width + x) * 4 + 2] = 0x00; // red
-      ctx.data[(y * ctx.width + x) * 4 + 3] = 0xFF; // alpha
+    const yc = (y % (2*size) > size);
+    while (x < buf.width) {
+      const xc = (x % (2*size) > size);
+      buf.data[(y * buf.width + x) * 4] = if (yc or xc) 0xFF else 0x00; // blue
+      buf.data[(y * buf.width + x) * 4 + 1] = if (yc) 0xFF else 0x00; // green
+      buf.data[(y * buf.width + x) * 4 + 2] = if (yc or xc) 0xFF else 0x00; // red
+      buf.data[(y * buf.width + x) * 4 + 3] = 0xFF; // alpha
       x+=1;
     }
     y+=1;
   }
+}
+
+// Render a frame, includes (re)allocating buffers
+fn render(ctx: *Context) void {
+  if (!ctx.configured) return;
+
+  // TODO: when we commit the buffer, we transfer ownership to the compositor
+  var buffer = &ctx.displayBuffer;
+
+  if (ctx.width == 0) ctx.width = 125; 
+  if (ctx.height == 0) ctx.height = 125; 
+  const buf_size = ctx.width * ctx.height * 4;
+  if (buf_size == 0) return;
+
+  print("width: {}, height: {}\n", .{ctx.width, ctx.height});
+  if (ctx.width != buffer.width or ctx.height != buffer.height) {
+    print("Buffer needs a resize\n", .{});
+    // If the window needs to get bigger
+    if (buffer.data.len < buf_size) {
+      os.ftruncate(ctx.shm_fd, buf_size) catch return;
+      os.munmap(buffer.data);
+      buffer.data = os.mmap(
+        null, buf_size,
+        os.PROT.READ | os.PROT.WRITE,
+        os.MAP.SHARED, ctx.shm_fd, 0) catch return;
+      ctx.shm_pool.resize(@intCast(i32, buf_size));
+    }
+    buffer.width = ctx.width;
+    buffer.stride = ctx.width * 4;
+    buffer.height = ctx.height;
+  } else {
+    print("No resize needed\n", .{});
+  }
+
+  const wl_buffer = ctx.shm_pool.createBuffer(
+    0, @intCast(i32, buffer.width),
+    @intCast(i32, buffer.height),
+    @intCast(i32, buffer.stride),
+    wl.Shm.Format.argb8888) catch return;
+  // wl_buffer.setListener(*DisplayBuffer, bufListener, &ctx.displayBuffer);
+
+  drawGrid(buffer);
+  // ctx.surface.attach(ctx.displayBuffer.buffer, 0, 0);
+  ctx.surface.attach(wl_buffer, 0, 0);
+  ctx.surface.damage(0, 0, 2^32, 2^32);
+  ctx.surface.commit();
 }
 
 pub fn main() anyerror!void {
@@ -96,72 +183,90 @@ pub fn main() anyerror!void {
   const registry = try wl_display.getRegistry();
   print("Connected\n", .{});
 
-  var ctx = Context {
+  var wl_globals = WlGlobals {
     .compositor = null,
     .shm        = null,
     .xdg        = null,
   };
 
-  registry.setListener(*Context, registryListner, &ctx);
+  registry.setListener(*WlGlobals, registryListner, &wl_globals);
   _ = try wl_display.roundtrip();
 
-  const compositor = ctx.compositor orelse return error.NoWlCompositor;
-  const shm        = ctx.shm orelse return error.NoWlShm;
-  const xdg_wm_base    = ctx.xdg orelse return error.NoXdgBase;
-
-  // Create a shared memory pool, I'm just going to accept the magic for now
-  const width = 128;
-  const height = 128;
-  const stride = width * 4;
-  const buf_size = stride * height;
-
-  const fd = try os.memfd_create("zig-ime", 0);
-  try os.ftruncate(fd, buf_size);
-  const data = try os.mmap(
-    null, buf_size,
-    os.PROT.READ | os.PROT.WRITE,
-    os.MAP.SHARED, fd, 0);
-
-  const gridSurface = GridSurface {
-    .height = height,
-    .width = width,
-    .data = data,
-  };
-  drawGrid(gridSurface);
-
-  const pool = try shm.createPool(fd , buf_size);
-  defer pool.destroy();
-
-  const buffer = blk: {
-    break :blk try pool.createBuffer(0, width, height, stride,
-                                     wl.Shm.Format.argb8888);
-  };
-  defer buffer.destroy();
+  const compositor  = wl_globals.compositor orelse return error.NoWlCompositor;
+  const shm         = wl_globals.shm orelse return error.NoWlShm;
+  const xdg_wm_base = wl_globals.xdg orelse return error.NoXdgBase;
 
   const surface = try compositor.createSurface();
   defer surface.destroy();
   const xdg_surface = try xdg_wm_base.getXdgSurface(surface);
   defer xdg_surface.destroy();
-  const xdg_toplevel = try xdg_surface.getToplevel();
-  defer xdg_toplevel.destroy();
+  const toplevel = try xdg_surface.getToplevel();
+  defer toplevel.destroy();
   surface.commit();
 
-  var running = true;
-  xdg_wm_base.setListener(*bool, baseListener, &running);
-  xdg_surface.setListener(*wl.Surface, surfaceListener, surface);
-  xdg_toplevel.setListener(*bool, topLevelListener, &running);
+  // default sizes
+  const width = 125;
+  const height = 125;
+  const stride = width * 4;
+  const buf_size = stride * height;
+
+  // variable:	lifetime:		description:
+  // fd:	applicatin lifetime	backign file descriptor
+  // data:	applicatin lifetime	pointer to mmaped fd
+  // pool:	applicatin lifetime	backing memory
+  // buffer:	a frame (reusable)	portion of pool to display
+  // note: The pool may be replaced with a new one in order to shrink it
+  const fd = try os.memfd_create("zig-ime", 0);
+  try os.ftruncate(fd, buf_size);
+  // TODO: const data = @bitCast([]u32, data);
+  const data = try os.mmap(
+    null, buf_size,
+    os.PROT.READ | os.PROT.WRITE,
+    os.MAP.SHARED, fd, 0);
+
+  // TODO: rename
+  const pool = try shm.createPool(fd , @intCast(i32, stride * height));
+  defer pool.destroy();
+
+  const buffer = try pool.createBuffer(
+    0, @intCast(i32, width),
+    @intCast(i32, height),
+    @intCast(i32, stride),
+    wl.Shm.Format.argb8888);
+  defer buffer.destroy();
+
+  var gridCtx = DisplayBuffer {
+    .height = height,
+    .width = width,
+    .stride = stride,
+    .buffer = buffer,
+    .data = data,
+  };
+
+
+  // TODO: rename
+  var appCtx = Context {
+    .height = 0,
+    .width = 0,
+    .displayBuffer = gridCtx,
+    .shm_fd = fd,
+    .shm_pool = pool,
+    .surface = surface,
+    .toplevel = toplevel,
+    .configured = false,
+    .running = true,
+  };
+
+  xdg_wm_base.setListener(*Context, baseListener, &appCtx);
+  xdg_surface.setListener(*Context, surfaceListener, &appCtx);
+  toplevel.setListener(*Context, topLevelListener, &appCtx);
   _ = try wl_display.roundtrip();
 
-  print("Attaching buffer\n", .{});
-  surface.attach(buffer, 0, 0);
-  // TODO: use uint32 max
-  surface.damage(0, 0, 2^32, 2^32);
-  surface.commit();
-
   print("Running main loop\n", .{});
-  while (running) {
+  while (appCtx.running) {
     print("Main loop iteraton\n", .{});
     _ = try wl_display.dispatch();
   }
+
   print("Exiting\n", .{});
 }
