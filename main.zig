@@ -15,10 +15,10 @@ const WlGlobals = struct {
 const Context = struct {
   width: usize,
   height: usize,
-  shm_fd: i32,
-  shm_pool: *wl.ShmPool,
+  // TODO: store a globals object
+  shm: *wl.Shm,
   // TODO: does this need to be nulllable?
-  displayBuffer: DisplayBuffer,
+  buffers: []DisplayBuffer,
   running: bool,
   configured: bool,
   surface: *wl.Surface,
@@ -29,15 +29,16 @@ const DisplayBuffer = struct {
   width: usize,
   height: usize,
   stride: usize,
+  busy: bool,
   data: []align(4096) u8,
-  buffer: *wl.Buffer,
+  wl_buffer: *wl.Buffer,
 };
 
 // Used to get wayland globals
 fn registryListner(registry: *wl.Registry,
                    event: wl.Registry.Event,
                    ctx: *WlGlobals) void {
- switch (event) {
+  switch (event) {
     .global => |g| {
       // print("interface: {s},\tversion: {},\tname: {}\n", .{g.interface, g.version, g.name});
       // TODO: use a lookup table for this
@@ -83,7 +84,7 @@ fn topLevelListener(_: *xdg.Toplevel,
       // replace zero size with defaults
       if (config.height > 0) ctx.height = @intCast(usize, config.height);
       if (config.height > 0) ctx.width = @intCast(usize, config.width);
-      render(ctx);
+      // we'll re-render in the surfaceListener configure event
     }
   }
 }
@@ -112,6 +113,7 @@ fn bufListener(buf: *wl.Buffer, event: wl.Buffer.Event, _: *DisplayBuffer) void 
 // Draw a test grid to the provided buffer
 fn drawGrid(buf: *DisplayBuffer) void {
   const size = @minimum(buf.width, buf.height) / 10;
+  print("Drawing to buffer at: {*}\n", .{buf.data});
 
   var y: usize = 0;
   while (y < buf.height) {
@@ -129,48 +131,111 @@ fn drawGrid(buf: *DisplayBuffer) void {
   }
 }
 
-// Render a frame, includes (re)allocating buffers
-fn render(ctx: *Context) void {
-  if (!ctx.configured) return;
-
-  // TODO: when we commit the buffer, we transfer ownership to the compositor
-  var buffer = &ctx.displayBuffer;
-
+// How this works:
+// - Search for a buffer that isn't in use
+//  - Resize it if necessary
+// - Creat a buffer if less than 2 exist, and none are available
+// 
+// If we assume that there are only ever 2 buffers
+// then we can create them when the app starts,
+// and not care about them here
+fn getBuffer(ctx: *Context) !DisplayBuffer {
   if (ctx.width == 0) ctx.width = 125; 
   if (ctx.height == 0) ctx.height = 125; 
-  const buf_size = ctx.width * ctx.height * 4;
-  if (buf_size == 0) return;
+
+  const width = ctx.width;
+  const height = ctx.height;
+  const stride = ctx.width * 4;
+  const buf_size = width * height * 4;
+
+  if (buf_size == 0) return error.emptyBuffer;
+
+  // TODO: create a buffer if none exist
+  // buffer = blk: if (ctx.buffers.len == 0) {
+  //   return 
+  //   }
+
+  // var buffer = &ctx.displayBuffer;
+  // var buffer: *DisplayBuffer = &(ctx.buffers[0]);
+
+  // variable:	lifetime:		description:
+  // fd:	applicatin lifetime	backign file descriptor
+  // data:	applicatin lifetime	pointer to mmaped fd
+  // pool:	applicatin lifetime	backing memory
+  // buffer:	a frame (reusable)	portion of pool to display
+  // note: The pool may be replaced with a new one in order to shrink it
+  const fd = try os.memfd_create("wayland-backing", 0);
+  try os.ftruncate(fd, buf_size);
+  // TODO: const data = @bitCast([]u32, data);
+  const data = try os.mmap(
+    null, buf_size,
+    os.PROT.READ | os.PROT.WRITE,
+    os.MAP.SHARED, fd, 0);
+  data[0] = 1;
+  // print("mmaped buffer at: {*}", data);
+
+  // TODO: rename
+  const pool = try ctx.shm.createPool(fd , @intCast(i32, buf_size));
+  defer pool.destroy();
+
+  const wl_buffer = try pool.createBuffer(
+    0, @intCast(i32, width),
+    @intCast(i32, height),
+    @intCast(i32, stride),
+    wl.Shm.Format.argb8888);
+
+  var buffer = DisplayBuffer {
+    .height = height,
+    .width = width,
+    .stride = stride,
+    .busy = false,
+    .wl_buffer = wl_buffer,
+    .data = data,
+  };
+  wl_buffer.setListener(*DisplayBuffer, bufListener, &buffer);
 
   print("width: {}, height: {}\n", .{ctx.width, ctx.height});
-  if (ctx.width != buffer.width or ctx.height != buffer.height) {
+  // if (ctx.width != buffer.width or ctx.height != buffer.height) {
     print("Buffer needs a resize\n", .{});
     // If the window needs to get bigger
-    if (buffer.data.len < buf_size) {
-      os.ftruncate(ctx.shm_fd, buf_size) catch return;
-      os.munmap(buffer.data);
-      buffer.data = os.mmap(
-        null, buf_size,
-        os.PROT.READ | os.PROT.WRITE,
-        os.MAP.SHARED, ctx.shm_fd, 0) catch return;
-      ctx.shm_pool.resize(@intCast(i32, buf_size));
-    }
+    // if (buffer.data.len < buf_size) {
+      // try os.ftruncate(fd, buf_size);
+      // os.munmap(buffer.data);
+      // buffer.data = try os.mmap(
+      //   null, buf_size,
+      //   os.PROT.READ | os.PROT.WRITE,
+      //   os.MAP.SHARED, fd, 0);
+      // pool.resize(@intCast(i32, buf_size));
+    // }
     buffer.width = ctx.width;
     buffer.stride = ctx.width * 4;
     buffer.height = ctx.height;
-  } else {
-    print("No resize needed\n", .{});
-  }
+  // } else {
+  //   print("No resize needed\n", .{});
+  // }
 
-  const wl_buffer = ctx.shm_pool.createBuffer(
-    0, @intCast(i32, buffer.width),
-    @intCast(i32, buffer.height),
-    @intCast(i32, buffer.stride),
-    wl.Shm.Format.argb8888) catch return;
-  // wl_buffer.setListener(*DisplayBuffer, bufListener, &ctx.displayBuffer);
+  // const wl_buffer = try pool.createBuffer(
+  //   0, @intCast(i32, buffer.width),
+  //   @intCast(i32, buffer.height),
+  //   @intCast(i32, buffer.stride),
+  //   wl.Shm.Format.argb8888);
+  // wl_buffer.setListener(*DisplayBuffer, bufListener, buffer);
+  // buffer.wl_buffer = wl_buffer;
 
-  drawGrid(buffer);
+  return buffer;
+}
+
+// Render a frame, includes (re)allocating buffers
+fn render(ctx: *Context) void {
+  print("Rendering\n", .{});
+  if (!ctx.configured) return;
+
+  var buffer = getBuffer(ctx) catch unreachable;
+
+  drawGrid(&buffer);
   // ctx.surface.attach(ctx.displayBuffer.buffer, 0, 0);
-  ctx.surface.attach(wl_buffer, 0, 0);
+  buffer.busy = true;
+  ctx.surface.attach(buffer.wl_buffer, 0, 0);
   ctx.surface.damage(0, 0, 2^32, 2^32);
   ctx.surface.commit();
 }
@@ -204,53 +269,12 @@ pub fn main() anyerror!void {
   defer toplevel.destroy();
   surface.commit();
 
-  // default sizes
-  const width = 125;
-  const height = 125;
-  const stride = width * 4;
-  const buf_size = stride * height;
-
-  // variable:	lifetime:		description:
-  // fd:	applicatin lifetime	backign file descriptor
-  // data:	applicatin lifetime	pointer to mmaped fd
-  // pool:	applicatin lifetime	backing memory
-  // buffer:	a frame (reusable)	portion of pool to display
-  // note: The pool may be replaced with a new one in order to shrink it
-  const fd = try os.memfd_create("zig-ime", 0);
-  try os.ftruncate(fd, buf_size);
-  // TODO: const data = @bitCast([]u32, data);
-  const data = try os.mmap(
-    null, buf_size,
-    os.PROT.READ | os.PROT.WRITE,
-    os.MAP.SHARED, fd, 0);
-
-  // TODO: rename
-  const pool = try shm.createPool(fd , @intCast(i32, stride * height));
-  defer pool.destroy();
-
-  const buffer = try pool.createBuffer(
-    0, @intCast(i32, width),
-    @intCast(i32, height),
-    @intCast(i32, stride),
-    wl.Shm.Format.argb8888);
-  defer buffer.destroy();
-
-  var gridCtx = DisplayBuffer {
-    .height = height,
-    .width = width,
-    .stride = stride,
-    .buffer = buffer,
-    .data = data,
-  };
-
-
   // TODO: rename
   var appCtx = Context {
     .height = 0,
     .width = 0,
-    .displayBuffer = gridCtx,
-    .shm_fd = fd,
-    .shm_pool = pool,
+    .buffers = &.{},
+    .shm = shm,
     .surface = surface,
     .toplevel = toplevel,
     .configured = false,
