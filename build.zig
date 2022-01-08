@@ -16,24 +16,45 @@ pub fn build(b: *Builder) void {
     .path = .{ .generated = &scanner.result },
   };
 
-  // TODO: build both the gui and the input-method connector
-  const exe = b.addExecutable("zig-input-method", "input-method.zig");
-  exe.setTarget(target);
-  exe.setBuildMode(mode);
+  //
+  // input-method connector
+  //
+  const inputMethod = b.addExecutable("input-method", "input-method.zig");
+  inputMethod.setTarget(target);
+  inputMethod.setBuildMode(mode);
 
-  exe.step.dependOn(&scanner.step);
-  exe.addPackage(wayland);
-  exe.linkLibC();
-  exe.linkSystemLibrary("wayland-client");
+  inputMethod.step.dependOn(&scanner.step);
+  inputMethod.addPackage(wayland);
+  inputMethod.linkLibC();
+  inputMethod.linkSystemLibrary("wayland-client");
 
-  scanner.addCSource(exe);
-
-  exe.install();
+  scanner.addCSource(inputMethod);
+  inputMethod.install();
 
   // run with: zig build run
-  const run_cmd = exe.run();
-  run_cmd.step.dependOn(b.getInstallStep());
+  const im_run = inputMethod.run();
+  im_run.step.dependOn(b.getInstallStep());
+  const im_run_step = b.step("run-im", "Run the input method bridge");
+  im_run_step.dependOn(&im_run.step);
 
-  const run_step = b.step("run", "Run the app");
-  run_step.dependOn(&run_cmd.step);
+  //
+  // Item selector executable
+  //
+  const selector = b.addExecutable("selector", "main.zig");
+  selector.setTarget(target);
+  selector.setBuildMode(mode);
+
+  selector.step.dependOn(&scanner.step);
+  selector.addPackage(wayland);
+  selector.linkLibC();
+  selector.linkSystemLibrary("wayland-client");
+
+  scanner.addCSource(selector);
+  selector.install();
+
+  // run with: zig build run
+  const run_selector = selector.run();
+  run_selector.step.dependOn(b.getInstallStep());
+  const run_step = b.step("run-selector", "Run the gui word selector");
+  run_step.dependOn(&run_selector.step);
 }
