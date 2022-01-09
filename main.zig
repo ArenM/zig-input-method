@@ -5,15 +5,20 @@ const print = std.debug.print;
 const wayland = @import("wayland");
 const wl = wayland.client.wl;
 const xdg = wayland.client.xdg;
+const zwlr = wayland.client.zwlr;
 
 const default_width = 150;
 const default_height = 150;
 const default_stride = default_width * 4;
 
+//
+// Data Types
+//
 const WlGlobals = struct {
   compositor: ?*wl.Compositor,
   shm: ?*wl.Shm,
   xdg: ?*xdg.WmBase,
+  layerShell: ?*zwlr.LayerShellV1,
 };
 
 const Context = struct {
@@ -25,7 +30,6 @@ const Context = struct {
   running: bool,
   configured: bool,
   surface: *wl.Surface,
-  toplevel: *const xdg.Toplevel,
 };
 
 const DisplayBuffer = struct {
@@ -37,6 +41,10 @@ const DisplayBuffer = struct {
   data: []align(4096) u8,
   wl_buffer: *wl.Buffer,
 };
+
+//
+// Wayland Functions
+//
 
 // Used to get wayland globals
 fn registryListner(registry: *wl.Registry,
@@ -52,6 +60,9 @@ fn registryListner(registry: *wl.Registry,
       } else if (std.cstr.cmp(g.interface, wl.Shm.getInterface().name) == 0) {
         print("Got Shm\n", .{});
         ctx.shm = registry.bind(g.name, wl.Shm, 1) catch return;
+      } else if (std.cstr.cmp(g.interface, zwlr.LayerShellV1.getInterface().name) == 0) {
+        print("Got LayerShell\n", .{});
+        ctx.layerShell = registry.bind(g.name, zwlr.LayerShellV1, 3) catch return;
       } else if (std.cstr.cmp(g.interface, xdg.WmBase.getInterface().name) == 0) {
         print("Got XdgWmBase\n", .{});
         ctx.xdg = registry.bind(g.name, xdg.WmBase, 1) catch return;
@@ -61,34 +72,21 @@ fn registryListner(registry: *wl.Registry,
   }
 }
 
-// Ack the configure event
-fn surfaceListener(xdg_surface: *xdg.Surface,
-                   event: xdg.Surface.Event,
-                   ctx: *Context) void {
-  print("surfaceListener: {}\n", .{event});
+// Ack configure events
+fn wlrSurfaceListener(surface: *zwlr.LayerSurfaceV1,
+                      event: zwlr.LayerSurfaceV1.Event,
+                      ctx: *Context) void {
+  print("wlrSurfaceListener: {}\n", .{event});
   switch (event) {
-    .configure => |configure| {
-      print("Ack configure\n", .{});
+    .configure => |conf| {
+      surface.ackConfigure(conf.serial);
       ctx.configured = true;
-      xdg_surface.ackConfigure(configure.serial);
+      ctx.width = @intCast(usize, conf.width);
+      ctx.height = @intCast(usize, conf.height);
       render(ctx);
-    }
-  }
-}
 
-// Resize, and Close events
-fn topLevelListener(_: *xdg.Toplevel,
-                    event: xdg.Toplevel.Event,
-                    ctx: *Context) void {
-  switch (event) {
-    .close => ctx.running = false,
-    .configure => |config| { // resize event
-      print("resize from {}\n", .{ctx.height});
-
-      // If these are zero defaults will be set when we get the next buffer
-      ctx.height = @intCast(usize, config.height);
-      ctx.width = @intCast(usize, config.width);
-    }
+    },
+    .closed => {},
   }
 }
 
@@ -111,6 +109,10 @@ fn bufListener(_: *wl.Buffer, event: wl.Buffer.Event, buffer: *DisplayBuffer) vo
     }
   }
 }
+
+//
+// Rendering
+//
 
 // Draw a test grid to the provided buffer
 fn drawGrid(buf: *DisplayBuffer) void {
@@ -152,9 +154,6 @@ fn getBuffer(ctx: *Context) !*DisplayBuffer {
   const stride = ctx.width * 4;
   const buf_size = width * height * 4;
 
-  // TODO: use ctx.next
-  // - set it when a buffer is released
-  // - unset it here
   const buffer: *DisplayBuffer = blk: {
     if (!ctx.buffers[0].busy) break :blk &ctx.buffers[0]
     else if (!ctx.buffers[1].busy) break :blk &ctx.buffers[1]
@@ -249,6 +248,7 @@ pub fn main() anyerror!void {
     .compositor = null,
     .shm        = null,
     .xdg        = null,
+    .layerShell = null,
   };
 
   registry.setListener(*WlGlobals, registryListner, &wl_globals);
@@ -256,15 +256,14 @@ pub fn main() anyerror!void {
 
   const compositor  = wl_globals.compositor orelse return error.NoWlCompositor;
   const shm         = wl_globals.shm orelse return error.NoWlShm;
-  const xdg_wm_base = wl_globals.xdg orelse return error.NoXdgBase;
+  const xdgWmBase = wl_globals.xdg orelse return error.NoXdgBase;
+  const layerShell  = wl_globals.layerShell orelse return error.NoLayerShell;
 
   const surface = try compositor.createSurface();
   defer surface.destroy();
-  const xdg_surface = try xdg_wm_base.getXdgSurface(surface);
-  defer xdg_surface.destroy();
-  const toplevel = try xdg_surface.getToplevel();
-  defer toplevel.destroy();
-  surface.commit();
+
+  // todo: we may want to find the correct output ourselves
+  const wlrSurface = try layerShell.getLayerSurface(surface, null, zwlr.LayerShellV1.Layer.top, "");
 
   var appCtx = Context {
     .height = 0,
@@ -272,14 +271,16 @@ pub fn main() anyerror!void {
     .buffers = .{try makeEmptyBuf(shm), try makeEmptyBuf(shm)},
     .shm = shm,
     .surface = surface,
-    .toplevel = toplevel,
     .configured = false,
     .running = true,
   };
 
-  xdg_wm_base.setListener(*Context, baseListener, &appCtx);
-  xdg_surface.setListener(*Context, surfaceListener, &appCtx);
-  toplevel.setListener(*Context, topLevelListener, &appCtx);
+  xdgWmBase.setListener(*Context, baseListener, &appCtx);
+  wlrSurface.setListener(*Context, wlrSurfaceListener, &appCtx);
+  wlrSurface.setAnchor(.{.bottom = true, .left = true, .right = true});
+  wlrSurface.setSize(0, 40);
+
+  surface.commit();
   _ = try wl_display.roundtrip();
 
   print("Running main loop\n", .{});
