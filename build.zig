@@ -48,6 +48,7 @@ pub fn build(b: *Builder) void {
   selector.addPackage(wayland);
   selector.linkLibC();
   selector.linkSystemLibrary("wayland-client");
+  selector.linkSystemLibrary("pangocairo");
 
   scanner.addCSource(selector);
   selector.install();

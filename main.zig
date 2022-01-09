@@ -2,6 +2,10 @@ const std = @import("std");
 const os = std.os;
 const print = std.debug.print;
 
+const rend = @cImport({
+  @cInclude("pango/pangocairo.h");
+});
+
 const wayland = @import("wayland");
 const wl = wayland.client.wl;
 const xdg = wayland.client.xdg;
@@ -114,25 +118,40 @@ fn bufListener(_: *wl.Buffer, event: wl.Buffer.Event, buffer: *DisplayBuffer) vo
 // Rendering
 //
 
-// Draw a test grid to the provided buffer
-fn drawGrid(buf: *DisplayBuffer) void {
-  const size = @minimum(buf.width, buf.height) / 10;
-  print("Drawing to buffer at: {*}\n", .{buf.data});
+// Draw somethign with pango
+fn draw(buf: *DisplayBuffer) void {
+  const surface = rend.cairo_image_surface_create_for_data(
+      @ptrCast([*c]u8, buf.data[0..]),
+      rend.CAIRO_FORMAT_ARGB32,
+      @intCast(c_int, buf.width),
+      @intCast(c_int, buf.height),
+      @intCast(c_int, buf.width * 4));
 
-  var y: usize = 0;
-  while (y < buf.height) {
-    var x: usize = 0;
-    const yc = (y % (2*size) > size);
-    while (x < buf.width) {
-      const xc = (x % (2*size) > size);
-      buf.data[(y * buf.width + x) * 4] = if (yc or xc) 0xFF else 0x00; // blue
-      buf.data[(y * buf.width + x) * 4 + 1] = if (yc) 0xFF else 0x00; // green
-      buf.data[(y * buf.width + x) * 4 + 2] = if (yc or xc) 0xFF else 0x00; // red
-      buf.data[(y * buf.width + x) * 4 + 3] = 0xFF; // alpha
-      x+=1;
-    }
-    y+=1;
-  }
+  const cr = rend.cairo_create(surface);
+  defer rend.cairo_destroy(cr);
+  rend.cairo_scale(cr, 0.1, 0.1);
+
+  // Draw the background
+  rend.cairo_set_source_rgb(cr, 0, 1, 0);
+  rend.cairo_paint(cr);
+
+  // Prepare text drawing surface
+  const layout = rend.pango_cairo_create_layout(cr);
+  defer rend.g_object_unref(layout);
+
+  // TODO: make this configurable, it works for a poc like this
+  const desc = rend.pango_font_description_from_string("Sans");
+  rend.pango_font_description_set_absolute_size(desc,
+      24 * 96 * @intToFloat(f64, rend.PANGO_SCALE) / (72.0 * 0.1));
+  rend.pango_layout_set_font_description(layout, desc);
+  rend.pango_font_description_free(desc);
+
+
+  // Draw test
+  const text = "Some Text";
+  rend.cairo_set_source_rgb(cr, 0, 0, 0);
+  rend.pango_layout_set_text(layout, text, text.len);
+  rend.pango_cairo_show_layout(cr, layout);
 }
 
 // How this works:
@@ -195,9 +214,10 @@ fn render(ctx: *Context) void {
   if (!ctx.configured) return;
 
   var buffer = getBuffer(ctx) catch return;
-
-  drawGrid(buffer);
   buffer.busy = true;
+
+  draw(buffer);
+
   ctx.surface.attach(buffer.wl_buffer, 0, 0);
   ctx.surface.damage(0, 0, 2^32, 2^32);
   ctx.surface.commit();
@@ -208,7 +228,6 @@ fn makeEmptyBuf(shm: *wl.Shm) !DisplayBuffer {
   const fd = try os.memfd_create("wayland-backing", 0);
 
   try os.ftruncate(fd, buf_size);
-  // TODO: try const data = @bitCast([]u32, data);
   const data = try os.mmap(
     null, buf_size,
     os.PROT.READ | os.PROT.WRITE,
@@ -279,6 +298,8 @@ pub fn main() anyerror!void {
   wlrSurface.setListener(*Context, wlrSurfaceListener, &appCtx);
   wlrSurface.setAnchor(.{.bottom = true, .left = true, .right = true});
   wlrSurface.setSize(0, 40);
+  // TODO: can we control the order of this with the keybaord
+  wlrSurface.setExclusiveZone(40);
 
   surface.commit();
   _ = try wl_display.roundtrip();
