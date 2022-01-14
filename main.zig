@@ -22,18 +22,21 @@ const WlGlobals = struct {
   compositor: ?*wl.Compositor,
   shm: ?*wl.Shm,
   xdg: ?*xdg.WmBase,
+  seat: ?*wl.Seat,
   layerShell: ?*zwlr.LayerShellV1,
 };
 
 const Context = struct {
+  configured: bool,
+  running: bool,
+  mouseRegistered: bool,
   width: usize,
   height: usize,
+  pointerX: isize,
   // TODO: store a globals object instead
   shm: *wl.Shm,
-  buffers: [2]DisplayBuffer,
-  running: bool,
-  configured: bool,
   surface: *wl.Surface,
+  buffers: [2]DisplayBuffer,
 };
 
 const DisplayBuffer = struct {
@@ -64,6 +67,9 @@ fn registryListner(registry: *wl.Registry,
       } else if (std.cstr.cmp(g.interface, wl.Shm.getInterface().name) == 0) {
         print("Got Shm\n", .{});
         ctx.shm = registry.bind(g.name, wl.Shm, 1) catch return;
+      } else if (std.cstr.cmp(g.interface, wl.Seat.getInterface().name) == 0) {
+        print("Got Seat\n", .{});
+        ctx.seat = registry.bind(g.name, wl.Seat, 7) catch return;
       } else if (std.cstr.cmp(g.interface, zwlr.LayerShellV1.getInterface().name) == 0) {
         print("Got LayerShell\n", .{});
         ctx.layerShell = registry.bind(g.name, zwlr.LayerShellV1, 3) catch return;
@@ -76,24 +82,6 @@ fn registryListner(registry: *wl.Registry,
   }
 }
 
-// Ack configure events
-fn wlrSurfaceListener(surface: *zwlr.LayerSurfaceV1,
-                      event: zwlr.LayerSurfaceV1.Event,
-                      ctx: *Context) void {
-  print("wlrSurfaceListener: {}\n", .{event});
-  switch (event) {
-    .configure => |conf| {
-      surface.ackConfigure(conf.serial);
-      ctx.configured = true;
-      ctx.width = @intCast(usize, conf.width);
-      ctx.height = @intCast(usize, conf.height);
-      render(ctx);
-
-    },
-    .closed => {},
-  }
-}
-
 // Let the compositor know we're not deadlocked
 fn baseListener(wm: *xdg.WmBase, event: xdg.WmBase.Event, _: *Context) void {
   print("base event: {}\n", .{event});
@@ -101,6 +89,50 @@ fn baseListener(wm: *xdg.WmBase, event: xdg.WmBase.Event, _: *Context) void {
     .ping => |ping| {
       wm.pong(ping.serial);
     }
+  }
+}
+
+// Handle input events
+fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, ctx: *Context) void {
+  switch (event) {
+    .button => |button| {
+      if (button.state == wl.Pointer.ButtonState.released) {
+        print("Mosue released at: {}\n", .{ctx.pointerX});
+      }
+    },
+    .motion => |move| { ctx.pointerX = move.surface_x.toInt(); },
+    else => {},
+  }
+}
+
+// Configure input events
+fn seatListener(seat: *wl.Seat, event: wl.Seat.Event, ctx: *Context) void {
+  print("Seat event\n", .{});
+  switch (event) {
+    .capabilities => |cap| {
+      if (!ctx.mouseRegistered and cap.capabilities.pointer) {
+        const pointer = seat.getPointer() catch return;
+        pointer.setListener(*Context, pointerListener, ctx);
+      }
+    },
+    .name => {},
+  }
+}
+
+// Ack configure events
+fn wlrSurfaceListener(surface: *zwlr.LayerSurfaceV1,
+                      event: zwlr.LayerSurfaceV1.Event,
+                      ctx: *Context) void {
+  print("wlrSurfaceListener\n", .{});
+  switch (event) {
+    .configure => |conf| {
+      surface.ackConfigure(conf.serial);
+      ctx.configured = true;
+      ctx.width = @intCast(usize, conf.width);
+      ctx.height = @intCast(usize, conf.height);
+      render(ctx);
+    },
+    .closed => {},
   }
 }
 
@@ -115,44 +147,165 @@ fn bufListener(_: *wl.Buffer, event: wl.Buffer.Event, buffer: *DisplayBuffer) vo
 }
 
 //
+// Word State
+//
+
+// Data layout for storing selectable words
+//
+// Changes queue:
+//  When new words are received they should be pushed to the queue
+//  then the draw operation should be run
+//
+// Stdin types:
+//  words are seperated by some char, use IFS?
+//  word sets are separated by newline
+//  each time a newline is read it should run clear
+//
+// Currently displayed words:
+//  after a word is rendered
+//  it should be moved to the list of displayed words
+//  along with it's maximum x value
+//
+// Handling click (select word)
+//  iterate over the list of displayed words
+//  post-increment the count, break if the items x value is greater than the clicks
+//  print the match (if found)
+//  run clear (if found)
+const WordState = struct {
+  const Self = @This();
+
+  off: isize = 0,
+  newWords: Queue_T = .{},
+  words: std.MultiArrayList(ActiveWord) = .{},
+  alloc: std.mem.Allocator,
+
+  const ActiveWord = struct {
+    word: []u8,
+    index: isize,
+  };
+
+  const Queue_T = std.TailQueue([]u8);
+  const QueueNode = Queue_T.Node;
+
+  fn init(alloc: std.mem.Allocator) WordState {
+    // TODO: it may be more efficient to use an arena allocator
+    // var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    // var alloc = arena.allocator();
+
+    return WordState { .alloc = alloc };
+  }
+
+  /// Queue a word to be added
+  fn addWord(self: *Self, word: []const u8) !void {
+    var owned_word: []u8 = try self.alloc.dupe(u8, word);
+    // var owned_word: []u8 = try self.alloc.alloc(u8, word.len);
+    // std.mem.copy(u8, owned_word, word);
+
+    const node = try self.alloc.create(Self.QueueNode);
+    node.data = owned_word;
+    self.newWords.append(node);
+  }
+
+  /// Move words from the queue and render
+  // - iterate over all items in the queue
+  // - render them
+  // - move them to the current words list
+  fn draw(self: *Self, ctx: *RenderCtx) !void {
+    var offset: isize = 0;
+
+    while (self.newWords.popFirst()) |node| {
+      // Prepare text drawing surface
+      const layout = try ctx.pangoLayout();
+      defer rend.g_object_unref(layout);
+
+      // Prepare text
+      rend.pango_layout_set_text(layout, @ptrCast([*c]const u8, node.data[0..]),
+          @intCast(c_int, node.data[0..].len));
+
+      // Get text size
+      var width: c_int = undefined;
+      rend.pango_layout_get_pixel_size(layout, @ptrCast([*c]c_int, &width), null);
+
+      // Draw border
+      rend.cairo_set_source_rgb(ctx.cairo, 0.5, 0, 0.5);
+      rend.cairo_rectangle(ctx.cairo, @intToFloat(f64, width + offset) + 4, 0, 5, 40);
+      rend.cairo_fill(ctx.cairo);
+
+      // Draw text
+      rend.cairo_move_to(ctx.cairo, @intToFloat(f64, offset), 0);
+      rend.cairo_set_source_rgb(ctx.cairo, 0, 0, 0);
+      rend.pango_cairo_show_layout(ctx.cairo, layout);
+
+      // Update internal state
+      offset += width + 20;
+      try self.words.append(self.alloc, .{.word=node.data, .index=offset});
+    }
+  }
+
+  // Would it make more sense to just throw the entire WordState struct away?
+  // - remove all items from the queue
+  // - remove all currently displayed words
+  // - fill the display with the background color
+  fn clear(self: *Self) void {
+    _ = self;
+    // TODO
+    // self.queue = std.ArrayList.init(self.arena.allocator());
+  }
+};
+
+//
 // Rendering
 //
 
-// Draw somethign with pango
-fn draw(buf: *DisplayBuffer) void {
-  const surface = rend.cairo_image_surface_create_for_data(
-      @ptrCast([*c]u8, buf.data[0..]),
-      rend.CAIRO_FORMAT_ARGB32,
-      @intCast(c_int, buf.width),
-      @intCast(c_int, buf.height),
-      @intCast(c_int, buf.width * 4));
+const RenderCtx = struct {
+  const Self = @This();
 
-  const cr = rend.cairo_create(surface);
-  defer rend.cairo_destroy(cr);
-  rend.cairo_scale(cr, 0.1, 0.1);
+  surface: *rend._cairo_surface,
+  cairo: *rend._cairo,
 
-  // Draw the background
-  rend.cairo_set_source_rgb(cr, 0, 1, 0);
-  rend.cairo_paint(cr);
+  fn init(buf: *DisplayBuffer) !Self {
+    const surface = rend.cairo_image_surface_create_for_data(
+        @ptrCast([*c]u8, buf.data[0..]),
+        rend.CAIRO_FORMAT_ARGB32,
+        @intCast(c_int, buf.width),
+        @intCast(c_int, buf.height),
+        @intCast(c_int, buf.width * 4))
+        orelse return error.CairoSurfaceError;
 
-  // Prepare text drawing surface
-  const layout = rend.pango_cairo_create_layout(cr);
-  defer rend.g_object_unref(layout);
+    const cairo = rend.cairo_create(surface) orelse return error.CairoCreateFailed;
+    rend.cairo_scale(cairo, 1, 1);
 
-  // TODO: make this configurable, it works for a poc like this
-  const desc = rend.pango_font_description_from_string("Sans");
-  rend.pango_font_description_set_absolute_size(desc,
-      24 * 96 * @intToFloat(f64, rend.PANGO_SCALE) / (72.0 * 0.1));
-  rend.pango_layout_set_font_description(layout, desc);
-  rend.pango_font_description_free(desc);
+    return Self {
+      .surface = surface,
+      .cairo = cairo,
+    };
+  }
 
+  /// Get a pango layout for darwing text
+  fn pangoLayout(self: *Self) !*rend.PangoLayout {
+    const layout = rend.pango_cairo_create_layout(self.cairo)
+        orelse return error.PangoCreateFailed;
 
-  // Draw test
-  const text = "Some Text";
-  rend.cairo_set_source_rgb(cr, 0, 0, 0);
-  rend.pango_layout_set_text(layout, text, text.len);
-  rend.pango_cairo_show_layout(cr, layout);
-}
+    // TODO: make this configurable, it works for a poc like this
+    const desc = rend.pango_font_description_from_string("Sans");
+    rend.pango_font_description_set_absolute_size(desc,
+        24 * 96 * @intToFloat(f64, rend.PANGO_SCALE) / (72.0));
+    rend.pango_layout_set_font_description(layout, desc);
+    rend.pango_font_description_free(desc);
+
+    return layout;
+  }
+
+  /// Draw the background
+  fn drawBackground(self: *Self) void {
+    rend.cairo_set_source_rgb(self.cairo, 1, 1, 1);
+    rend.cairo_paint(self.cairo);
+  }
+
+  fn deinit(self: *Self) void {
+    rend.cairo_destroy(self.cairo);
+  }
+};
 
 // How this works:
 // - Search for a buffer that isn't in use
@@ -216,7 +369,17 @@ fn render(ctx: *Context) void {
   var buffer = getBuffer(ctx) catch return;
   buffer.busy = true;
 
-  draw(buffer);
+  var renderCtx = RenderCtx.init(buffer) catch return;
+  defer renderCtx.deinit();
+
+  renderCtx.drawBackground();
+
+  // Draw some example words
+  var alloc: std.heap.GeneralPurposeAllocator(.{}) = .{};
+  var ws = WordState.init(alloc.allocator());
+  ws.addWord("A new word") catch return;
+  ws.addWord("Another word") catch return;
+  ws.draw(&renderCtx) catch return;
 
   ctx.surface.attach(buffer.wl_buffer, 0, 0);
   ctx.surface.damage(0, 0, 2^32, 2^32);
@@ -267,34 +430,35 @@ pub fn main() anyerror!void {
     .compositor = null,
     .shm        = null,
     .xdg        = null,
+    .seat       = null,
     .layerShell = null,
   };
 
   registry.setListener(*WlGlobals, registryListner, &wl_globals);
   _ = try wl_display.roundtrip();
 
-  const compositor  = wl_globals.compositor orelse return error.NoWlCompositor;
-  const shm         = wl_globals.shm orelse return error.NoWlShm;
-  const xdgWmBase = wl_globals.xdg orelse return error.NoXdgBase;
-  const layerShell  = wl_globals.layerShell orelse return error.NoLayerShell;
+  const compositor = wl_globals.compositor orelse return error.NoWlCompositor;
+  const shm        = wl_globals.shm orelse return error.NoWlShm;
+  const xdgWmBase  = wl_globals.xdg orelse return error.NoXdgBase;
+  const seat       = wl_globals.seat orelse return error.NoSeat;
+  const layerShell = wl_globals.layerShell orelse return error.NoLayerShell;
 
   const surface = try compositor.createSurface();
   defer surface.destroy();
 
   // todo: we may want to find the correct output ourselves
-  const wlrSurface = try layerShell.getLayerSurface(surface, null, zwlr.LayerShellV1.Layer.top, "");
+  const wlrSurface = try layerShell.getLayerSurface(surface, null,
+      zwlr.LayerShellV1.Layer.top, "");
 
-  var appCtx = Context {
-    .height = 0,
-    .width = 0,
-    .buffers = .{try makeEmptyBuf(shm), try makeEmptyBuf(shm)},
-    .shm = shm,
-    .surface = surface,
-    .configured = false,
-    .running = true,
-  };
+  // Initialize the appliccation context
+  var appCtx: Context = undefined;
+  appCtx.shm = shm;
+  appCtx.surface = surface;
+  appCtx.running = true;
+  appCtx.buffers = .{try makeEmptyBuf(shm), try makeEmptyBuf(shm)};
 
   xdgWmBase.setListener(*Context, baseListener, &appCtx);
+  seat.setListener(*Context, seatListener, &appCtx);
   wlrSurface.setListener(*Context, wlrSurfaceListener, &appCtx);
   wlrSurface.setAnchor(.{.bottom = true, .left = true, .right = true});
   wlrSurface.setSize(0, 40);
@@ -306,7 +470,6 @@ pub fn main() anyerror!void {
 
   print("Running main loop\n", .{});
   while (appCtx.running) {
-    print("Main loop iteraton\n", .{});
     _ = try wl_display.dispatch();
   }
 
