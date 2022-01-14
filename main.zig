@@ -19,20 +19,20 @@ const default_stride = default_width * 4;
 // Data Types
 //
 const WlGlobals = struct {
-  compositor: ?*wl.Compositor,
-  shm: ?*wl.Shm,
-  xdg: ?*xdg.WmBase,
-  seat: ?*wl.Seat,
-  layerShell: ?*zwlr.LayerShellV1,
+  compositor: ?*wl.Compositor = null,
+  shm: ?*wl.Shm = null,
+  xdg: ?*xdg.WmBase = null,
+  seat: ?*wl.Seat = null,
+  layerShell: ?*zwlr.LayerShellV1 = null,
 };
 
 const Context = struct {
-  configured: bool,
-  running: bool,
-  mouseRegistered: bool,
-  width: usize,
-  height: usize,
-  pointerX: isize,
+  running: bool = true,
+  configured: bool = false,
+  mouseRegistered: bool = false,
+  width: usize = default_width,
+  height: usize = default_height,
+  pointerX: isize = 0,
   // TODO: store a globals object instead
   shm: *wl.Shm,
   surface: *wl.Surface,
@@ -40,13 +40,13 @@ const Context = struct {
 };
 
 const DisplayBuffer = struct {
-  width: usize,
-  height: usize,
-  busy: bool,
+  busy: bool = false,
   shm_fd: i32,
+  width: usize = default_width,
+  height: usize = default_height,
   shm_pool: *wl.ShmPool,
-  data: []align(4096) u8,
   wl_buffer: *wl.Buffer,
+  data: []align(4096) u8,
 };
 
 //
@@ -405,11 +405,8 @@ fn makeEmptyBuf(shm: *wl.Shm) !DisplayBuffer {
     wl.Shm.Format.argb8888);
 
   var buffer = DisplayBuffer {
-    .height = default_height,
-    .width = default_width,
     .shm_fd = fd,
     .shm_pool = pool,
-    .busy = false,
     .wl_buffer = wl_buffer,
     .data = data,
   };
@@ -426,13 +423,7 @@ pub fn main() anyerror!void {
   const registry = try wl_display.getRegistry();
   print("Connected\n", .{});
 
-  var wl_globals = WlGlobals {
-    .compositor = null,
-    .shm        = null,
-    .xdg        = null,
-    .seat       = null,
-    .layerShell = null,
-  };
+  var wl_globals = WlGlobals {};
 
   registry.setListener(*WlGlobals, registryListner, &wl_globals);
   _ = try wl_display.roundtrip();
@@ -446,19 +437,18 @@ pub fn main() anyerror!void {
   const surface = try compositor.createSurface();
   defer surface.destroy();
 
-  // todo: we may want to find the correct output ourselves
-  const wlrSurface = try layerShell.getLayerSurface(surface, null,
-      zwlr.LayerShellV1.Layer.top, "");
-
-  // Initialize the appliccation context
-  var appCtx: Context = undefined;
-  appCtx.shm = shm;
-  appCtx.surface = surface;
-  appCtx.running = true;
-  appCtx.buffers = .{try makeEmptyBuf(shm), try makeEmptyBuf(shm)};
+  var appCtx = Context {
+    .shm = shm,
+    .surface = surface,
+    .buffers = .{try makeEmptyBuf(shm), try makeEmptyBuf(shm)},
+  };
 
   xdgWmBase.setListener(*Context, baseListener, &appCtx);
   seat.setListener(*Context, seatListener, &appCtx);
+
+  // todo: we may want to find the correct output ourselves
+  const wlrSurface = try layerShell.getLayerSurface(surface, null,
+      zwlr.LayerShellV1.Layer.top, "");
   wlrSurface.setListener(*Context, wlrSurfaceListener, &appCtx);
   wlrSurface.setAnchor(.{.bottom = true, .left = true, .right = true});
   wlrSurface.setSize(0, 40);
