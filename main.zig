@@ -11,8 +11,8 @@ const wl = wayland.client.wl;
 const xdg = wayland.client.xdg;
 const zwlr = wayland.client.zwlr;
 
-const default_width = 150;
-const default_height = 150;
+const default_width = 180;
+const default_height = 40;
 const default_stride = default_width * 4;
 
 //
@@ -36,6 +36,8 @@ const Context = struct {
   // TODO: store a globals object instead
   shm: *wl.Shm,
   surface: *wl.Surface,
+  wlrSurface: *zwlr.LayerSurfaceV1,
+  wordState: WordState,
   buffers: [2]DisplayBuffer,
 };
 
@@ -46,6 +48,8 @@ const DisplayBuffer = struct {
   height: usize = default_height,
   shm_pool: *wl.ShmPool,
   wl_buffer: *wl.Buffer,
+  surface: *rend._cairo_surface,
+  cairo: *rend._cairo,
   data: []align(4096) u8,
 };
 
@@ -98,6 +102,7 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, ctx: *Context) void 
     .button => |button| {
       if (button.state == wl.Pointer.ButtonState.released) {
         print("Mosue released at: {}\n", .{ctx.pointerX});
+        print("Found word: {s}\n", .{ctx.wordState.wordAtPos(ctx.pointerX)});
       }
     },
     .motion => |move| { ctx.pointerX = move.surface_x.toInt(); },
@@ -198,12 +203,42 @@ const WordState = struct {
   /// Queue a word to be added
   fn addWord(self: *Self, word: []const u8) !void {
     var owned_word: []u8 = try self.alloc.dupe(u8, word);
-    // var owned_word: []u8 = try self.alloc.alloc(u8, word.len);
-    // std.mem.copy(u8, owned_word, word);
 
     const node = try self.alloc.create(Self.QueueNode);
     node.data = owned_word;
     self.newWords.append(node);
+  }
+
+  fn wordAtPos(self: *Self, pos: isize) ?[]u8 {
+    var i: usize = 0;
+    for (self.words.items(.index)) |index| {
+      if (index > pos) return self.words.get(i).word;
+      i += 1;
+    }
+
+    return null;
+  }
+
+  fn drawWord(word: []const u8, offset: isize, layout: *rend.PangoLayout, ctx: *RenderCtx) isize {
+      // Prepare text
+      rend.pango_layout_set_text(layout, @ptrCast([*c]const u8, word),
+          @intCast(c_int, word.len));
+
+      // Get text size
+      var width: c_int = undefined;
+      rend.pango_layout_get_pixel_size(layout, @ptrCast([*c]c_int, &width), null);
+
+      // Draw border
+      rend.cairo_set_source_rgb(ctx.cairo, 0.5, 0, 0.5);
+      rend.cairo_rectangle(ctx.cairo, @intToFloat(f64, width + offset) + 4, 0, 3, 40);
+      rend.cairo_fill(ctx.cairo);
+
+      // Draw text
+      rend.cairo_move_to(ctx.cairo, @intToFloat(f64, offset), 0);
+      rend.cairo_set_source_rgb(ctx.cairo, 0, 0, 0);
+      rend.pango_cairo_show_layout(ctx.cairo, layout);
+
+      return width;
   }
 
   /// Move words from the queue and render
@@ -212,33 +247,18 @@ const WordState = struct {
   // - move them to the current words list
   fn draw(self: *Self, ctx: *RenderCtx) !void {
     var offset: isize = 0;
+    const layout = try ctx.pangoLayout();
+
+    for (self.words.items(.word)) |word| {
+      if (offset >= ctx.buf.width) break;
+      offset = offset + drawWord(word[0..], offset, layout, ctx) + 20;
+      rend.cairo_set_source_rgb(ctx.cairo, 0, 0, 0);
+    }
 
     while (self.newWords.popFirst()) |node| {
-      // Prepare text drawing surface
-      const layout = try ctx.pangoLayout();
-      defer rend.g_object_unref(layout);
-
-      // Prepare text
-      rend.pango_layout_set_text(layout, @ptrCast([*c]const u8, node.data[0..]),
-          @intCast(c_int, node.data[0..].len));
-
-      // Get text size
-      var width: c_int = undefined;
-      rend.pango_layout_get_pixel_size(layout, @ptrCast([*c]c_int, &width), null);
-
-      // Draw border
-      rend.cairo_set_source_rgb(ctx.cairo, 0.5, 0, 0.5);
-      rend.cairo_rectangle(ctx.cairo, @intToFloat(f64, width + offset) + 4, 0, 5, 40);
-      rend.cairo_fill(ctx.cairo);
-
-      // Draw text
-      rend.cairo_move_to(ctx.cairo, @intToFloat(f64, offset), 0);
-      rend.cairo_set_source_rgb(ctx.cairo, 0, 0, 0);
-      rend.pango_cairo_show_layout(ctx.cairo, layout);
-
-      // Update internal state
-      offset += width + 20;
+      offset += drawWord(node.data, offset, layout, ctx) + 20;
       try self.words.append(self.alloc, .{.word=node.data, .index=offset});
+      if (offset >= ctx.buf.width) break;
     }
   }
 
@@ -257,64 +277,14 @@ const WordState = struct {
 // Rendering
 //
 
-const RenderCtx = struct {
-  const Self = @This();
-
-  surface: *rend._cairo_surface,
-  cairo: *rend._cairo,
-
-  fn init(buf: *DisplayBuffer) !Self {
-    const surface = rend.cairo_image_surface_create_for_data(
-        @ptrCast([*c]u8, buf.data[0..]),
-        rend.CAIRO_FORMAT_ARGB32,
-        @intCast(c_int, buf.width),
-        @intCast(c_int, buf.height),
-        @intCast(c_int, buf.width * 4))
-        orelse return error.CairoSurfaceError;
-
-    const cairo = rend.cairo_create(surface) orelse return error.CairoCreateFailed;
-    rend.cairo_scale(cairo, 1, 1);
-
-    return Self {
-      .surface = surface,
-      .cairo = cairo,
-    };
-  }
-
-  /// Get a pango layout for darwing text
-  fn pangoLayout(self: *Self) !*rend.PangoLayout {
-    const layout = rend.pango_cairo_create_layout(self.cairo)
-        orelse return error.PangoCreateFailed;
-
-    // TODO: make this configurable, it works for a poc like this
-    const desc = rend.pango_font_description_from_string("Sans");
-    rend.pango_font_description_set_absolute_size(desc,
-        24 * 96 * @intToFloat(f64, rend.PANGO_SCALE) / (72.0));
-    rend.pango_layout_set_font_description(layout, desc);
-    rend.pango_font_description_free(desc);
-
-    return layout;
-  }
-
-  /// Draw the background
-  fn drawBackground(self: *Self) void {
-    rend.cairo_set_source_rgb(self.cairo, 1, 1, 1);
-    rend.cairo_paint(self.cairo);
-  }
-
-  fn deinit(self: *Self) void {
-    rend.cairo_destroy(self.cairo);
-  }
-};
-
 // How this works:
 // - Search for a buffer that isn't in use
-//  - Resize it if necessary
+// - Resize it if necessary
 //
 // variable:	lifetime:		description:
 // fd:		applicatin lifetime	backign file descriptor
-// data:	applicatin lifetime	pointer to mmaped fd
-// pool:	applicatin lifetime	backing memory
+// data:	many frames		pointer to mmaped fd
+// pool:	many frames		backing memory
 // buffer:	a frame (reusable)	portion of pool to display
 // note: The pool must be replaced with a new one in order to shrink it
 fn getBuffer(ctx: *Context) !*DisplayBuffer {
@@ -356,10 +326,80 @@ fn getBuffer(ctx: *Context) !*DisplayBuffer {
       @intCast(i32, stride),
       wl.Shm.Format.argb8888);
     buffer.wl_buffer.setListener(*DisplayBuffer, bufListener, buffer);
+
+    // TODO: extract this to a helper function
+    rend.cairo_destroy(buffer.cairo);
+    rend.cairo_surface_destroy(buffer.surface);
+    const ptr = @ptrCast([*c]u8, buffer.data);
+    const surface = rend.cairo_image_surface_create_for_data(
+        ptr, rend.CAIRO_FORMAT_ARGB32,
+        @intCast(c_int, width),
+        @intCast(c_int, height),
+        @intCast(c_int, stride))
+        orelse return error.CairoSurfaceError;
+
+    const cairo = rend.cairo_create(surface) orelse return error.CairoCreateFailed;
+    rend.cairo_scale(cairo, 1, 1);
+
+    // TODO: can we control the order of this with the keybaord
+    // TODO: this isn't called if we happen to set the defaults correctly
+    ctx.wlrSurface.setExclusiveZone(@intCast(i32, height));
   }
 
   return buffer;
 }
+
+const RenderCtx = struct {
+  const Self = @This();
+
+  surface: *rend._cairo_surface,
+  cairo: *rend._cairo,
+  buf: *DisplayBuffer,
+  layout: ?*rend.PangoLayout = null,
+
+  fn init(buf: *DisplayBuffer) !Self {
+    const surface = buf.surface;
+    const cairo: *rend._cairo = buf.cairo;
+
+    return Self {
+      .surface = surface,
+      .cairo = cairo,
+      .buf = buf,
+    };
+  }
+
+  /// Return the current pango layout, or create one if it's not available
+  fn pangoLayout(self: *Self) !*rend.PangoLayout {
+    if (self.layout) |layout| {
+      return layout;
+    }
+
+    const layout = rend.pango_cairo_create_layout(self.cairo)
+    orelse return error.PangoCreateFailed;
+
+    // TODO: make this configurable, it works for a poc like this
+    const desc = rend.pango_font_description_from_string("Sans");
+    rend.pango_font_description_set_absolute_size(desc,
+    24 * 96 * @intToFloat(f64, rend.PANGO_SCALE) / (72.0));
+    rend.pango_layout_set_font_description(layout, desc);
+    rend.pango_font_description_free(desc);
+
+    return layout;
+  }
+
+  /// Draw the background
+  fn drawBackground(self: *Self) void {
+    rend.cairo_set_source_rgb(self.cairo, 1, 1, 1);
+    rend.cairo_paint(self.cairo);
+  }
+
+  fn deinit(self: *Self) void {
+    _ = self;
+    // if (self.layout) |layout| rend.g_object_unref(layout);
+    // rend.cairo_destroy(self.cairo);
+    // rend.cairo_surface_destroy(self.surface);
+  }
+};
 
 // Render a frame, includes (re)allocating buffers
 fn render(ctx: *Context) void {
@@ -371,19 +411,19 @@ fn render(ctx: *Context) void {
 
   var renderCtx = RenderCtx.init(buffer) catch return;
   defer renderCtx.deinit();
-
   renderCtx.drawBackground();
 
   // Draw some example words
-  var alloc: std.heap.GeneralPurposeAllocator(.{}) = .{};
-  var ws = WordState.init(alloc.allocator());
-  ws.addWord("A new word") catch return;
-  ws.addWord("Another word") catch return;
-  ws.draw(&renderCtx) catch return;
+  ctx.wordState.addWord("Add") catch return;
+  ctx.wordState.draw(&renderCtx) catch return;
 
+  // The bitwise not of 0 is the largest possible number for a uint
+  // TODO: there should be an easier way to do this
+  const max = @intCast(i32, ~@as(u31, 0));
   ctx.surface.attach(buffer.wl_buffer, 0, 0);
-  ctx.surface.damage(0, 0, 2^32, 2^32);
+  ctx.surface.damage(0, 0, max, max);
   ctx.surface.commit();
+  print("Done Rendering\n", .{});
 }
 
 fn makeEmptyBuf(shm: *wl.Shm) !DisplayBuffer {
@@ -404,11 +444,24 @@ fn makeEmptyBuf(shm: *wl.Shm) !DisplayBuffer {
     @intCast(i32, default_stride),
     wl.Shm.Format.argb8888);
 
+  const ptr = @ptrCast([*c]u8, data);
+  const surface = rend.cairo_image_surface_create_for_data(
+      ptr, rend.CAIRO_FORMAT_ARGB32,
+      @intCast(c_int, default_width),
+      @intCast(c_int, default_height),
+      @intCast(c_int, default_stride))
+      orelse return error.CairoSurfaceError;
+
+  const cairo = rend.cairo_create(surface) orelse return error.CairoCreateFailed;
+  rend.cairo_scale(cairo, 1, 1);
+
   var buffer = DisplayBuffer {
     .shm_fd = fd,
     .shm_pool = pool,
     .wl_buffer = wl_buffer,
     .data = data,
+    .surface = surface,
+    .cairo = cairo,
   };
   wl_buffer.setListener(*DisplayBuffer, bufListener, &buffer);
 
@@ -437,24 +490,26 @@ pub fn main() anyerror!void {
   const surface = try compositor.createSurface();
   defer surface.destroy();
 
+  var alloc: std.heap.GeneralPurposeAllocator(.{}) = .{};
   var appCtx = Context {
     .shm = shm,
     .surface = surface,
     .buffers = .{try makeEmptyBuf(shm), try makeEmptyBuf(shm)},
+    .wordState = WordState.init(alloc.allocator()),
+    .wlrSurface = try layerShell.getLayerSurface(surface, null,
+        zwlr.LayerShellV1.Layer.top, ""),
   };
+
+  try appCtx.wordState.addWord("Launched");
+  try appCtx.wordState.addWord("Launched2");
 
   xdgWmBase.setListener(*Context, baseListener, &appCtx);
   seat.setListener(*Context, seatListener, &appCtx);
 
-  // todo: we may want to find the correct output ourselves
-  const wlrSurface = try layerShell.getLayerSurface(surface, null,
-      zwlr.LayerShellV1.Layer.top, "");
-  wlrSurface.setListener(*Context, wlrSurfaceListener, &appCtx);
-  wlrSurface.setAnchor(.{.bottom = true, .left = true, .right = true});
-  wlrSurface.setSize(0, 40);
-  // TODO: can we control the order of this with the keybaord
-  wlrSurface.setExclusiveZone(40);
-
+  // TODO: we may want to find the correct output ourselves
+  appCtx.wlrSurface.setListener(*Context, wlrSurfaceListener, &appCtx);
+  appCtx.wlrSurface.setAnchor(.{.bottom = true, .left = true, .right = true});
+  appCtx.wlrSurface.setSize(0, default_height);
   surface.commit();
   _ = try wl_display.roundtrip();
 
