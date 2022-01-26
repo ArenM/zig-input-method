@@ -39,6 +39,12 @@ const Context = struct {
   wlrSurface: *zwlr.LayerSurfaceV1,
   wordState: WordState,
   buffers: [2]DisplayBuffer,
+
+  fn requestFrame(self: *Context) !void {
+    var cb = try self.surface.frame();
+    cb.setListener(*Context, frameListener, self);
+    self.surface.commit();
+  }
 };
 
 const DisplayBuffer = struct {
@@ -151,6 +157,14 @@ fn wlrSurfaceListener(surface: *zwlr.LayerSurfaceV1,
     },
     .closed => {},
   }
+}
+
+fn frameListener(cb: *wl.Callback,
+                 _: wl.Callback.Event,
+                 ctx: *Context) void {
+  print("Got frame callback\n", .{});
+  cb.destroy();
+  render(ctx);
 }
 
 // Buffer release
@@ -321,8 +335,7 @@ fn processRead(ctx: *ReadCtx, appCtx: *Context) !void {
   // Handle each line
   while (std.mem.indexOf(u8, ctx.buf[0..ctx.head], "\n")) |line_end| {
     try appCtx.wordState.addWord(ctx.buf[0..line_end]);
-    // TODO: this should schedule a frame
-    render(appCtx);
+    try appCtx.requestFrame();
     ctx.head -= line_end + 1; // include the newline
     std.mem.copy(u8, &ctx.buf, ctx.buf[line_end + 1..]);
   }
