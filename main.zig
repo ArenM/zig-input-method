@@ -279,6 +279,7 @@ const WordState = struct {
     while (self.newWords.popFirst()) |node| {
       offset += drawWord(node.data, offset, layout, ctx) + 20;
       try self.words.append(self.alloc, .{.word=node.data, .index=offset});
+      self.alloc.destroy(node);
       if (offset >= ctx.buf.width) break;
     }
   }
@@ -288,9 +289,22 @@ const WordState = struct {
   // - remove all currently displayed words
   // - fill the display with the background color
   fn clear(self: *Self) void {
-    _ = self;
-    // TODO
-    // self.queue = std.ArrayList.init(self.arena.allocator());
+    // Free words
+    for (self.words.items(.word)) |word| {
+      self.alloc.free(word);
+    }
+
+    // Free queue nodes
+    while (self.newWords.pop()) |node| {
+      self.alloc.free(node.data);
+      self.alloc.destroy(node);
+    }
+
+    // Free words list
+    self.words.deinit(self.alloc);
+
+    self.newWords = .{};
+    self.words = .{};
   }
 };
 
@@ -424,7 +438,7 @@ const RenderCtx = struct {
     // TODO: make this configurable, it works for a poc like this
     const desc = rend.pango_font_description_from_string("Sans");
     rend.pango_font_description_set_absolute_size(desc,
-    24 * 96 * @intToFloat(f64, rend.PANGO_SCALE) / (72.0));
+        24 * 96 * @intToFloat(f64, rend.PANGO_SCALE) / (72.0));
     rend.pango_layout_set_font_description(layout, desc);
     rend.pango_font_description_free(desc);
 
@@ -438,10 +452,7 @@ const RenderCtx = struct {
   }
 
   fn deinit(self: *Self) void {
-    _ = self;
-    // if (self.layout) |layout| rend.g_object_unref(layout);
-    // rend.cairo_destroy(self.cairo);
-    // rend.cairo_surface_destroy(self.surface);
+    if (self.layout) |layout| rend.g_object_unref(layout);
   }
 };
 
