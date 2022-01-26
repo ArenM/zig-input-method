@@ -17,12 +17,13 @@ const WlGlobals = struct {
 };
 
 const InputState = struct {
-  inputMethod: *zwp.InputMethodV2,
   serial: u32,
   cursor: u32,
-  predictorFile: std.fs.File,
-  text_buf: [4000]u8,
   text: []u8,
+  inputMethod: *zwp.InputMethodV2,
+  predictorFile: std.fs.File,
+  alloc: std.mem.Allocator,
+  text_buf: [4000]u8,
 };
 
 const Pending = struct {
@@ -92,12 +93,26 @@ fn currentWord(text: []const u8, cursor: usize) ![]const u8 {
   return text[start..end];
 }
 
-fn predictedLine(line: []const u8) void {
+fn predictedLine(ctx: *InputState, line: []const u8) void {
   print("Completed word to: {s}\n", .{line});
+  // TODO: handle error
+
+  var start = ctx.cursor;
+  while (start > 0) {
+    if (ctx.text[start - 1] == ' ') break;
+    start -= 1;
+  }
+  ctx.inputMethod.deleteSurroundingText((ctx.cursor - start) + 1, 0);
+
+  const line0 = ctx.alloc.dupeZ(u8, line) catch return;
+  ctx.inputMethod.commitString(line0);
+  ctx.alloc.free(line0);
+
+  ctx.inputMethod.commit(ctx.serial);
 }
 
 // Call a function for each line read from a file descriptor
-fn processRead(ctx: *ReadCtx) !void {
+fn processRead(ctx: *ReadCtx, inputCtx: *InputState) !void {
   // Calculate the availabe space we can read into
   // TODO: consider dropping data instead
   // print("Handling read\n", .{});
@@ -109,7 +124,7 @@ fn processRead(ctx: *ReadCtx) !void {
 
   // Handle each line
   while (std.mem.indexOf(u8, ctx.buf[0..ctx.head], "\n")) |line_end| {
-    predictedLine(ctx.buf[0..line_end]);
+    predictedLine(inputCtx, ctx.buf[0..line_end]);
     ctx.head -= line_end + 1; // include the newline
     std.mem.copy(u8, &ctx.buf, ctx.buf[line_end + 1..]);
   }
@@ -226,8 +241,9 @@ pub fn main() anyerror!void {
   registry.setListener(*WlGlobals, registryListner, &wl_globals);
   _ = try wl_display.roundtrip();
 
-  const seat        = wl_globals.seat orelse return error.NoTextInput;
-  const inputMethodManager   = wl_globals.inputMethodManager orelse return error.NoTextInput;
+  const seat        = wl_globals.seat orelse return error.NoWlSeat;
+  const inputMethodManager   = wl_globals.inputMethodManager orelse return
+    error.NoWlTextInput;
 
   // Spawn the predictor
   var buffer: [512]u8 = undefined;
@@ -247,6 +263,7 @@ pub fn main() anyerror!void {
   };
 
   // Configure the input-method interface
+  var alloc: std.heap.GeneralPurposeAllocator(.{}) = .{};
   var inputState = InputState {
     .text = undefined,
     .text_buf = undefined,
@@ -254,6 +271,7 @@ pub fn main() anyerror!void {
     .serial = 0,
     .cursor = 0,
     .predictorFile = predictor.stdin.?,
+    .alloc = alloc.allocator(),
   };
 
   inputState.inputMethod.setListener(*InputState, inputListener, &inputState);
@@ -274,6 +292,9 @@ pub fn main() anyerror!void {
   //  - Upon POLLIN events, call wl_display_dispatch to process incoming events.
   //  - To flush outgoing requests, call wl_display_flush.
   while (true) {
+    // Always flush the wayland display, in case we talked to it
+    _ = try wl_display.flush();
+
     const events = try os.poll(&fds, std.math.maxInt(i32));
     if (events == 0) continue;
 
@@ -281,10 +302,7 @@ pub fn main() anyerror!void {
     if (fds[0].revents & os.POLL.IN != 0) _ = try wl_display.dispatch();
 
     // Handle completed words
-    if (fds[1].revents & os.POLL.IN != 0) _ = try processRead(&readCtx);
-
-    // Always flush the wayland display, in case something else talked to it
-    _ = try wl_display.flush();
+    if (fds[1].revents & os.POLL.IN != 0) _ = try processRead(&readCtx, &inputState);
 
     // Break if there was a poll error
     if (fds[0].revents & err_mask != 0
