@@ -9,7 +9,9 @@ pub fn build(b: *Builder) void {
   const scanner = ScanProtocolsStep.create(b);
   scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
   scanner.addSystemProtocol("unstable/text-input/text-input-unstable-v3.xml");
-  scanner.addProtocolPath("input-method-unstable-v2.xml");
+  scanner.addProtocolPath("proto/input-method-unstable-v2.xml");
+  // TODO: this is only required for the selector
+  scanner.addProtocolPath("proto/wlr-layer-shell-unstable-v1.xml");
 
   const wayland = std.build.Pkg{
     .name = "wayland",
