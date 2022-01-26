@@ -53,6 +53,13 @@ const DisplayBuffer = struct {
   data: []align(4096) u8,
 };
 
+const ReadCtx = struct {
+  buf: [512]u8,
+  fd: i32,
+  head: usize = 0,
+};
+
+
 //
 // Wayland Functions
 //
@@ -102,7 +109,12 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, ctx: *Context) void 
     .button => |button| {
       if (button.state == wl.Pointer.ButtonState.released) {
         print("Mosue released at: {}\n", .{ctx.pointerX});
-        print("Found word: {s}\n", .{ctx.wordState.wordAtPos(ctx.pointerX)});
+
+        // print the word to stdout
+        const out = std.io.getStdOut();
+        out.writer()
+          .print("{s}\n", .{ctx.wordState.wordAtPos(ctx.pointerX)})
+          catch return;
       }
     },
     .motion => |move| { ctx.pointerX = move.surface_x.toInt(); },
@@ -202,9 +214,18 @@ const WordState = struct {
 
   /// Queue a word to be added
   fn addWord(self: *Self, word: []const u8) !void {
-    var owned_word: []u8 = try self.alloc.dupe(u8, word);
+    // Don't include empty lines
+    if (word.len == 0) return;
 
+    // lines prefixed with the escape character are treated as commmands
+    if (word[0] == 0x1B) {
+      if (std.mem.eql(u8, word[1..], "clear")) self.clear();
+      return;
+    }
+
+    var owned_word: []u8 = try self.alloc.dupe(u8, word);
     const node = try self.alloc.create(Self.QueueNode);
+
     node.data = owned_word;
     self.newWords.append(node);
   }
@@ -272,6 +293,29 @@ const WordState = struct {
     // self.queue = std.ArrayList.init(self.arena.allocator());
   }
 };
+
+// Call a function for each line read from a file descriptor
+fn processRead(ctx: *ReadCtx, appCtx: *Context) !void {
+  // Calculate the availabe space we can read into
+  // TODO: consider dropping data instead
+  if (ctx.head >= ctx.buf.len) return error.BufOverflow;
+
+  // Read data into the buffer
+  const read = try os.read(ctx.fd, ctx.buf[ctx.head..]);
+  ctx.head += read;
+
+  // Handle each line
+  while (std.mem.indexOf(u8, ctx.buf[0..ctx.head], "\n")) |line_end| {
+    try appCtx.wordState.addWord(ctx.buf[0..line_end]);
+    // TODO: this should schedule a frame
+    render(appCtx);
+    ctx.head -= line_end + 1; // include the newline
+    std.mem.copy(u8, &ctx.buf, ctx.buf[line_end + 1..]);
+  }
+
+  // Break when we reach EOF
+  if (read == 0) return error.EOF;
+}
 
 //
 // Rendering
@@ -412,9 +456,6 @@ fn render(ctx: *Context) void {
   var renderCtx = RenderCtx.init(buffer) catch return;
   defer renderCtx.deinit();
   renderCtx.drawBackground();
-
-  // Draw some example words
-  ctx.wordState.addWord("Add") catch return;
   ctx.wordState.draw(&renderCtx) catch return;
 
   // The bitwise not of 0 is the largest possible number for a uint
@@ -500,9 +541,6 @@ pub fn main() anyerror!void {
         zwlr.LayerShellV1.Layer.top, ""),
   };
 
-  try appCtx.wordState.addWord("Launched");
-  try appCtx.wordState.addWord("Launched2");
-
   xdgWmBase.setListener(*Context, baseListener, &appCtx);
   seat.setListener(*Context, seatListener, &appCtx);
 
@@ -511,11 +549,41 @@ pub fn main() anyerror!void {
   appCtx.wlrSurface.setAnchor(.{.bottom = true, .left = true, .right = true});
   appCtx.wlrSurface.setSize(0, default_height);
   surface.commit();
-  _ = try wl_display.roundtrip();
+  // _ = try wl_display.roundtrip();
 
   print("Running main loop\n", .{});
+
+  const errMask = os.POLL.ERR | os.POLL.NVAL | os.POLL.HUP;
+
+  const wayland_fd = wl_display.getFd();
+  var fds = [_]os.pollfd {
+    .{ .fd = wayland_fd, .events = os.POLL.IN, .revents = undefined },
+    .{ .fd = std.os.STDIN_FILENO, .events = os.POLL.IN, .revents = undefined },
+  };
+  var readCtx: ReadCtx = .{
+    .buf = undefined,
+    .fd = std.os.STDIN_FILENO,
+  };
+
   while (appCtx.running) {
-    _ = try wl_display.dispatch();
+    // Always flush the wayland display, in case something else talked to it
+    _ = try wl_display.flush();
+
+    const events = try os.poll(&fds, std.math.maxInt(i32));
+    if (events == 0) continue;
+
+    // Handle wayland events
+    if (fds[0].revents & os.POLL.IN != 0) _ = try wl_display.dispatch();
+
+    // Handle completed words
+    if (fds[1].revents & os.POLL.IN != 0) _ = try processRead(&readCtx, &appCtx);
+
+    // Break if there was a poll error
+    if (fds[0].revents & errMask != 0
+        or fds[1].revents & errMask != 0) {
+      print("Poll Error\n", .{});
+      break;
+    }
   }
 
   print("Exiting\n", .{});
