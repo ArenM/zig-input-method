@@ -1,4 +1,5 @@
 const std = @import("std");
+const zig_version = @import("builtin").zig_version;
 const Builder = std.build.Builder;
 const ScanProtocolsStep = @import("deps/zig-wayland/build.zig").ScanProtocolsStep;
 
@@ -13,10 +14,15 @@ pub fn build(b: *Builder) void {
   // TODO: this is only required for the selector
   scanner.addProtocolPath("proto/wlr-layer-shell-unstable-v1.xml");
 
-  const wayland = std.build.Pkg{
-    .name = "wayland",
-    .path = .{ .generated = &scanner.result },
-  };
+  var wayland: std.build.Pkg = undefined;
+  if (zig_version.major == 0 and zig_version.minor <= 8) {
+    wayland = scanner.getPkg();
+  } else {
+    wayland = std.build.Pkg {
+      .name = "wayland",
+      .path = .{ .generated = &scanner.result },
+    };
+  }
 
   //
   // input-method connector

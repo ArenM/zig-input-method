@@ -1,4 +1,5 @@
 const std = @import("std");
+const zig_version = @import("builtin").zig_version;
 const os = std.os;
 const print = std.debug.print;
 const min = std.math.min;
@@ -50,7 +51,6 @@ const ReadCtx = struct {
   fd: i32,
 };
 
-const err_mask = os.POLL.ERR | os.POLL.NVAL | os.POLL.HUP;
 
 var pending = Pending {
   .text_buf = undefined,
@@ -247,7 +247,12 @@ pub fn main() anyerror!void {
 
   // Spawn the predictor
   var buffer: [512]u8 = undefined;
-  const allocator = std.heap.FixedBufferAllocator.init(&buffer).allocator();
+
+  // Handle differences between zig 0.8 and 0.9
+  const allocator = if (zig_version.major == 0 and zig_version.minor <= 8)
+    &std.heap.FixedBufferAllocator.init(&buffer).allocator
+  else
+    std.heap.FixedBufferAllocator.init(&buffer).allocator();
 
   const predictor = try std.ChildProcess.init(&.{"./complete-word.sh"}, allocator);
   defer predictor.deinit();
@@ -271,17 +276,30 @@ pub fn main() anyerror!void {
     .serial = 0,
     .cursor = 0,
     .predictorFile = predictor.stdin.?,
-    .alloc = alloc.allocator(),
+    .alloc = if (zig_version.major == 0 and zig_version.minor <= 8)
+      alloc.allocator
+     else
+      alloc.allocator(),
   };
 
   inputState.inputMethod.setListener(*InputState, inputListener, &inputState);
   _ = try wl_display.flush();
 
+  const POLLIN = if (zig_version.major == 0 and zig_version.minor <= 8)
+    std.c.POLLIN
+  else
+    os.POLL.IN;
+
+  const err_mask = if (zig_version.major == 0 and zig_version.minor <= 8)
+    std.c.POLLERR | std.c.POLLIN | std.c.POLLHUP
+  else 
+    os.POLL.ERR | os.POLL.NVAL | os.POLL.HUP;
+
   // Create the main loop
   const ev: i32 = wl_display.getFd();
   var fds = [_]os.pollfd{
-    .{ .fd = ev, .events = os.POLL.IN, .revents = undefined },
-    .{ .fd = predictor.stdout.?.handle, .events = os.POLL.IN, .revents = undefined },
+    .{ .fd = ev, .events = POLLIN, .revents = undefined },
+    .{ .fd = predictor.stdout.?.handle, .events = POLLIN, .revents = undefined },
   };
 
   // poll for output
@@ -299,10 +317,10 @@ pub fn main() anyerror!void {
     if (events == 0) continue;
 
     // Handle wayland events
-    if (fds[0].revents & os.POLL.IN != 0) _ = try wl_display.dispatch();
+    if (fds[0].revents & POLLIN != 0) _ = try wl_display.dispatch();
 
     // Handle completed words
-    if (fds[1].revents & os.POLL.IN != 0) _ = try processRead(&readCtx, &inputState);
+    if (fds[1].revents & POLLIN != 0) _ = try processRead(&readCtx, &inputState);
 
     // Break if there was a poll error
     if (fds[0].revents & err_mask != 0

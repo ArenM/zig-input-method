@@ -1,4 +1,5 @@
 const std = @import("std");
+const zig_version = @import("builtin").zig_version;
 const os = std.os;
 const print = std.debug.print;
 
@@ -208,7 +209,12 @@ const WordState = struct {
   off: isize = 0,
   newWords: Queue_T = .{},
   words: std.MultiArrayList(ActiveWord) = .{},
-  alloc: std.mem.Allocator,
+  alloc: Self.AllocType,
+
+  const AllocType = if (zig_version.major == 0 and zig_version.minor <= 8)
+    *std.mem.Allocator
+  else
+    std.mem.Allocator;
 
   const ActiveWord = struct {
     word: []u8,
@@ -218,7 +224,7 @@ const WordState = struct {
   const Queue_T = std.TailQueue([]u8);
   const QueueNode = Queue_T.Node;
 
-  fn init(alloc: std.mem.Allocator) WordState {
+  fn init(alloc: Self.AllocType) WordState {
     // TODO: it may be more efficient to use an arena allocator
     // var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     // var alloc = arena.allocator();
@@ -381,10 +387,16 @@ fn getBuffer(ctx: *Context) !*DisplayBuffer {
     if (buffer.data.len < buf_size) {
       try os.ftruncate(buffer.shm_fd, buf_size);
       os.munmap(buffer.data);
-      buffer.data = try os.mmap(
-        null, buf_size,
-        os.PROT.READ | os.PROT.WRITE,
-        os.MAP.SHARED, buffer.shm_fd, 0);
+      if (zig_version.major == 0 and zig_version.minor <= 8)
+          buffer.data = try os.mmap(
+            null, buf_size,
+            std.c.PROT_READ | std.c.PROT_WRITE,
+            std.c.MAP_SHARED, buffer.shm_fd, 0)
+      else
+          buffer.data = try os.mmap(
+            null, buf_size,
+            os.PROT.READ | os.PROT.WRITE,
+            os.MAP.SHARED, buffer.shm_fd, 0);
       buffer.shm_pool.resize(@intCast(i32, buf_size));
     }
 
@@ -402,8 +414,12 @@ fn getBuffer(ctx: *Context) !*DisplayBuffer {
     rend.cairo_destroy(buffer.cairo);
     rend.cairo_surface_destroy(buffer.surface);
     const ptr = @ptrCast([*c]u8, buffer.data);
+    const format = if (zig_version.major == 0 and zig_version.minor <= 8)
+      @intToEnum(rend.enum__cairo_format, rend.CAIRO_FORMAT_ARGB32)
+    else
+      rend.CAIRO_FORMAT_ARGB32;
     const surface = rend.cairo_image_surface_create_for_data(
-        ptr, rend.CAIRO_FORMAT_ARGB32,
+        ptr, format,
         @intCast(c_int, width),
         @intCast(c_int, height),
         @intCast(c_int, stride))
@@ -496,10 +512,16 @@ fn makeEmptyBuf(shm: *wl.Shm) !DisplayBuffer {
   const fd = try os.memfd_create("wayland-backing", 0);
 
   try os.ftruncate(fd, buf_size);
-  const data = try os.mmap(
-    null, buf_size,
-    os.PROT.READ | os.PROT.WRITE,
-    os.MAP.SHARED, fd, 0);
+  const data = if (zig_version.major == 0 and zig_version.minor <= 8)
+      try os.mmap(
+        null, buf_size,
+        std.c.PROT_READ | std.c.PROT_WRITE,
+        std.c.MAP_SHARED, fd, 0)
+  else
+      try os.mmap(
+        null, buf_size,
+        os.PROT.READ | os.PROT.WRITE,
+        os.MAP.SHARED, fd, 0);
   const pool = try shm.createPool(fd , @intCast(i32, default_stride * default_height));
 
   // create or resize only
@@ -510,8 +532,12 @@ fn makeEmptyBuf(shm: *wl.Shm) !DisplayBuffer {
     wl.Shm.Format.argb8888);
 
   const ptr = @ptrCast([*c]u8, data);
+  const format = if (zig_version.major == 0 and zig_version.minor <= 8)
+    @intToEnum(rend.enum__cairo_format, rend.CAIRO_FORMAT_ARGB32)
+  else
+    rend.CAIRO_FORMAT_ARGB32;
   const surface = rend.cairo_image_surface_create_for_data(
-      ptr, rend.CAIRO_FORMAT_ARGB32,
+      ptr, format,
       @intCast(c_int, default_width),
       @intCast(c_int, default_height),
       @intCast(c_int, default_stride))
@@ -560,7 +586,10 @@ pub fn main() anyerror!void {
     .shm = shm,
     .surface = surface,
     .buffers = .{try makeEmptyBuf(shm), try makeEmptyBuf(shm)},
-    .wordState = WordState.init(alloc.allocator()),
+    .wordState = if (zig_version.major == 0 and zig_version.minor <= 8)
+      WordState.init(&alloc.allocator)
+    else
+      WordState.init(alloc.allocator()),
     .wlrSurface = try layerShell.getLayerSurface(surface, null,
         zwlr.LayerShellV1.Layer.top, ""),
   };
@@ -577,12 +606,20 @@ pub fn main() anyerror!void {
 
   print("Running main loop\n", .{});
 
-  const errMask = os.POLL.ERR | os.POLL.NVAL | os.POLL.HUP;
+  const POLLIN = if (zig_version.major == 0 and zig_version.minor <= 8)
+    std.c.POLLIN
+  else
+    os.POLL.IN;
+
+  const errMask = if (zig_version.major == 0 and zig_version.minor <= 8)
+    std.c.POLLERR | std.c.POLLIN | std.c.POLLHUP
+  else 
+    os.POLL.ERR | os.POLL.NVAL | os.POLL.HUP;
 
   const wayland_fd = wl_display.getFd();
   var fds = [_]os.pollfd {
-    .{ .fd = wayland_fd, .events = os.POLL.IN, .revents = undefined },
-    .{ .fd = std.os.STDIN_FILENO, .events = os.POLL.IN, .revents = undefined },
+    .{ .fd = wayland_fd, .events = POLLIN, .revents = undefined },
+    .{ .fd = std.os.STDIN_FILENO, .events = POLLIN, .revents = undefined },
   };
   var readCtx: ReadCtx = .{
     .buf = undefined,
@@ -597,10 +634,10 @@ pub fn main() anyerror!void {
     if (events == 0) continue;
 
     // Handle wayland events
-    if (fds[0].revents & os.POLL.IN != 0) _ = try wl_display.dispatch();
+    if (fds[0].revents & POLLIN != 0) _ = try wl_display.dispatch();
 
     // Handle completed words
-    if (fds[1].revents & os.POLL.IN != 0) _ = try processRead(&readCtx, &appCtx);
+    if (fds[1].revents & POLLIN != 0) _ = try processRead(&readCtx, &appCtx);
 
     // Break if there was a poll error
     if (fds[0].revents & errMask != 0
