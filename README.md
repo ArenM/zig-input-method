@@ -21,9 +21,6 @@ zig build
 
 # Usage
 
-**NOTE:** for now the input-method binary is hard-coded to expect a script named
-`complete-word.sh` in its current working directory.
-
 ## Word completion using the input-method protocol
 
 The input-method binary implements the input-method protocol, and uses an

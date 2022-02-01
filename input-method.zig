@@ -115,7 +115,6 @@ fn predictedLine(ctx: *InputState, line: []const u8) void {
 fn processRead(ctx: *ReadCtx, inputCtx: *InputState) !void {
   // Calculate the availabe space we can read into
   // TODO: consider dropping data instead
-  // print("Handling read\n", .{});
   if (ctx.head >= ctx.buf.len) return error.BufOverflow;
 
   // Read data into the buffer
@@ -131,7 +130,6 @@ fn processRead(ctx: *ReadCtx, inputCtx: *InputState) !void {
 
   // Break when we reach EOF
   if (read == 0) return error.EOF;
-
 }
 
 //
@@ -144,8 +142,6 @@ fn registryListner(registry: *wl.Registry,
                    ctx: *WlGlobals) void {
   switch (event) {
     .global => |g| {
-      // print("interface: {s},\tversion: {},\tname: {}\n", .{g.interface, g.version, g.name});
-      // TODO: use a lookup table for this
       if (std.cstr.cmp(g.interface, wl.Seat.getInterface().name) == 0) {
         print("Got Seat\n", .{});
         ctx.seat = registry.bind(g.name, wl.Seat, 7) catch return;
@@ -207,9 +203,7 @@ fn inputListener(_: *zwp.InputMethodV2,
 
       print("text: {s}\n", .{pending.text});
 
-
       // if new text is different, restart the word search
-      // if (std.cstr.cmp(&ctx.text[0..], &pending.text[0..]) != 0) {
       if (changed) {
         print("Text changed\n", .{});
         const word = currentWord(ctx.text, ctx.cursor) catch return;
@@ -245,37 +239,23 @@ pub fn main() anyerror!void {
   const inputMethodManager   = wl_globals.inputMethodManager orelse return
     error.NoWlTextInput;
 
-  // Spawn the predictor
-  var buffer: [512]u8 = undefined;
-
-  // Handle differences between zig 0.8 and 0.9
-  const allocator = if (zig_version.major == 0 and zig_version.minor <= 8)
-    &std.heap.FixedBufferAllocator.init(&buffer).allocator
-  else
-    std.heap.FixedBufferAllocator.init(&buffer).allocator();
-
-  const predictor = try std.ChildProcess.init(&.{"./complete-word.sh"}, allocator);
-  defer predictor.deinit();
-
-  predictor.stdin_behavior = .Pipe;
-  predictor.stdout_behavior = .Pipe;
-  try predictor.spawn();
-
   var readCtx = ReadCtx {
     .buf = undefined,
     .head = 0,
-    .fd = predictor.stdout.?.handle,
+    .fd = std.io.getStdIn().handle,
   };
 
-  // Configure the input-method interface
+  // Handle differences between zig 0.8 and 0.9
   var alloc: std.heap.GeneralPurposeAllocator(.{}) = .{};
+
+  // Configure the input-method interface
   var inputState = InputState {
     .text = undefined,
     .text_buf = undefined,
     .inputMethod = try inputMethodManager.getInputMethod(seat),
     .serial = 0,
     .cursor = 0,
-    .predictorFile = predictor.stdin.?,
+    .predictorFile = std.io.getStdOut(),
     .alloc = if (zig_version.major == 0 and zig_version.minor <= 8)
       alloc.allocator
      else
@@ -299,7 +279,7 @@ pub fn main() anyerror!void {
   const ev: i32 = wl_display.getFd();
   var fds = [_]os.pollfd{
     .{ .fd = ev, .events = POLLIN, .revents = undefined },
-    .{ .fd = predictor.stdout.?.handle, .events = POLLIN, .revents = undefined },
+    .{ .fd = std.io.getStdIn().handle, .events = POLLIN, .revents = undefined },
   };
 
   // poll for output
