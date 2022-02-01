@@ -95,20 +95,40 @@ fn currentWord(text: []const u8, cursor: usize) ![]const u8 {
 
 fn predictedLine(ctx: *InputState, line: []const u8) void {
   print("Completed word to: {s}\n", .{line});
-  // TODO: handle error
 
   var start = ctx.cursor;
   while (start > 0) {
     if (ctx.text[start - 1] == ' ') break;
     start -= 1;
   }
-  ctx.inputMethod.deleteSurroundingText((ctx.cursor - start) + 1, 0);
+  ctx.inputMethod.deleteSurroundingText(ctx.cursor - start, 0);
 
   const line0 = ctx.alloc.dupeZ(u8, line) catch return;
-  ctx.inputMethod.commitString(line0);
-  ctx.alloc.free(line0);
+  defer ctx.alloc.free(line0);
 
+  ctx.inputMethod.commitString(line0);
   ctx.inputMethod.commit(ctx.serial);
+  ctx.inputMethod.commitString(" ");
+  ctx.inputMethod.commit(ctx.serial);
+}
+
+fn typedText(ctx: *InputState, line: []const u8) void {
+  const line0 = ctx.alloc.dupeZ(u8, line) catch return;
+  defer ctx.alloc.free(line0);
+
+  ctx.inputMethod.commitString(line0);
+  ctx.inputMethod.commit(ctx.serial);
+}
+
+fn processLine(ctx: *InputState, line: []const u8) void {
+  // We must have at least an operation, and a char
+  if (line.len < 2) return;
+
+  switch (line[0]) {
+    't' => typedText(ctx, line[1..]),
+    'w' => predictedLine(ctx, line[1..]),
+    else => {}
+  }
 }
 
 // Call a function for each line read from a file descriptor
@@ -122,8 +142,9 @@ fn processRead(ctx: *ReadCtx, inputCtx: *InputState) !void {
   ctx.head += read;
 
   // Handle each line
+  // TODO: handle sending a newline
   while (std.mem.indexOf(u8, ctx.buf[0..ctx.head], "\n")) |line_end| {
-    predictedLine(inputCtx, ctx.buf[0..line_end]);
+    processLine(inputCtx, ctx.buf[0..line_end]);
     ctx.head -= line_end + 1; // include the newline
     std.mem.copy(u8, &ctx.buf, ctx.buf[line_end + 1..]);
   }
@@ -169,6 +190,7 @@ fn inputListener(_: *zwp.InputMethodV2,
 
       // There is no text input sending events,
       // switch back to emulating one, or pass characters straight through
+      // Also notify the manager so it can hide the keyboard & selector
     },
     .surrounding_text => |surround| {
       const len = min(std.mem.len(surround.text), 4000);
@@ -203,7 +225,7 @@ fn inputListener(_: *zwp.InputMethodV2,
 
       print("text: {s}\n", .{pending.text});
 
-      // if new text is different, restart the word search
+      // notify the manager if new text is different
       if (changed) {
         print("Text changed\n", .{});
         const word = currentWord(ctx.text, ctx.cursor) catch return;
@@ -212,7 +234,7 @@ fn inputListener(_: *zwp.InputMethodV2,
         print("Current word: {s}\n", .{word});
       }
 
-      // GTK doesn't send the correct data, so prod it a bit
+      // GTK sends outdated data, so prod it a bit
       ctx.inputMethod.commitString("");
       ctx.inputMethod.commit(ctx.serial);
     },
@@ -272,7 +294,7 @@ pub fn main() anyerror!void {
 
   const err_mask = if (zig_version.major == 0 and zig_version.minor <= 8)
     std.c.POLLERR | std.c.POLLIN | std.c.POLLHUP
-  else 
+  else
     os.POLL.ERR | os.POLL.NVAL | os.POLL.HUP;
 
   // Create the main loop
@@ -306,6 +328,8 @@ pub fn main() anyerror!void {
     if (fds[0].revents & err_mask != 0
         or fds[1].revents & err_mask != 0) break;
   }
+  // TODO: write the pending word
+  _ = try wl_display.flush();
 
   print("Exiting\n", .{});
 }

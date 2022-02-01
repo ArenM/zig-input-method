@@ -26,18 +26,17 @@ rm "$TMP/3"
 #  - send the first char
 #  - send it's words to the selector
 stdbuf -o0 sed \
-  -e 's/ /\nt /g' \
-  -e 's/^/t /' \
+  -e 's/^/t/' \
   <&0 >&3 &
   # -e 's/^$/\n/g' \ # Empty lines are a return char
 
-./input-method.sh <&3 >&4 &
+../zig-out/bin/input-method <&3 >&4 &
 
 while read -r line; do
   printf '\033clear\n'
   [ "$line" = "" ] && continue
   # grep "^$line" /usr/share/dict/usa | head -n 30
   grep "^$line" ../wordsSorted.txt | head -n 30
-done <&4 | ../zig-out/bin/selector 2>/dev/null | stdbuf -o0 sed 's/^/s /' >&3 &
+done <&4 | ../zig-out/bin/selector | stdbuf -o0 sed 's/^/w/' >&3 &
 
 wait
