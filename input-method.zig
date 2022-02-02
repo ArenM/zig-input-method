@@ -122,12 +122,17 @@ fn typedText(ctx: *InputState, line: []const u8) void {
 
 fn processLine(ctx: *InputState, line: []const u8) void {
   // We must have at least an operation, and a char
-  if (line.len < 2) return;
+  if (line.len < 2) {
+    print("Input command too short: {s}\n", .{line});
+    return;
+  }
 
   switch (line[0]) {
     't' => typedText(ctx, line[1..]),
     'w' => predictedLine(ctx, line[1..]),
-    else => {}
+    else => {
+      print("Unknown input command: {s}\n", .{line});
+    }
   }
 }
 

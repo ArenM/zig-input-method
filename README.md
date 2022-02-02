@@ -21,16 +21,20 @@ zig build
 
 # Usage
 
-## Word completion using the input-method protocol
+The entire system can be run with the following. This supports both swipe-typing
+and prediction based on the current word.
 
-The input-method binary implements the input-method protocol, and uses an
-external program to to complete words. This can be compiled and run with
-`zig build run-im`.
+```
+wvkbd-mobintl -O | ./scripts/manager.sh
+```
 
-Currently it only works with text fields in applications that support the
-text_input_v3 protocol. I've been using gedit for testing.
+Note that currently only applications that that support the `text_input_v3`
+protocol are supported, I've been using gedit for testing. Also for this to be
+fully correct wvkbd needs to be patched to *only* output typed characters to
+stdout, and not attempt to send them to the compositor.
 
-## wvkbd swipe-typing
+
+## Using the selector for just wvkbd swipe-typing
 
 The selector program in this repository can be used as a menu for swype-typing
 with wvkbd.
@@ -39,7 +43,7 @@ with wvkbd.
 wvkbd-mobintl -O -L 240 |\
   swipeguess wordsSorted.txt 20 |\
   stdbuf -oL sed -e 's/^/\x1Bclear\n/g' -e 's/\t/\n/g' |\
-  ./zig-out/bin/selector | 
+  ./zig-out/bin/selector |\
   completelyTypeWord.sh
 ```
 
@@ -76,7 +80,7 @@ In Scope:
  - provide current word
  - provide surrounding words
  - provide input field type
- - send send selected text to the compositor
+ - send selected text to the compositor
  - change the current word (for autocorrect)
  - send partial words, only possible sometimes
    (with input-method but not virtual-keyboard)
